@@ -1,1 +1,6 @@
-requirements.txt
+fastparquet=2024.2.0
+pandas==1.5.3
+numpy==1.26.4
+sentencepiece==0.1.99
+fastparquet==2024.2.0
+matplotlib==3.8.0
