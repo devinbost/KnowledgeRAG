@@ -1,5 +1,5 @@
 fastparquet=2024.2.0
-pandas==1.5.3
+pandas==2.2.2
 numpy==1.26.4
 sentencepiece==0.1.99
 fastparquet==2024.2.0
