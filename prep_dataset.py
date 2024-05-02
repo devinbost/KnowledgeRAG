@@ -20,12 +20,11 @@ seed = 42
 random.seed(seed)
 np.random.seed(seed)
 
-class Part(BaseModel):
-    text: str
-    position: int
-    token: str
-    bucket: Optional[str] = None
-    swapped: bool
+context_text_length_max = 240
+relation_name_length_max = 25
+entity_name_length_max = 40
+entity_description_length_max = 200
+group_size_standard_deviation_max = 3
 
 class TestStudy(unittest.TestCase):
 
@@ -93,6 +92,7 @@ HeadEntityID\tRelationID\tTailEntityID
 3\t1\t2
 6\t5\t1
 6\t5\t3
+3\t3\t4
                 """)
 
         # Reading simulated data
@@ -296,17 +296,65 @@ HeadEntityID\tRelationID\tTailEntityID
         return filtered_triple_ids.reset_index(drop=True)
 
     def build_full_dataset(self, relation_df, entity_description_df, entity_name_df, entity_id_df, triple_id_df):
-        relation_df, entity_description_df, entity_name_df, triple_id_df = self.trim_statistically(self, relation_df, entity_description_df, entity_name_df, triple_id_df)
+        relation_df, entity_description_df, entity_name_df, triple_id_df = self.trim_statistically(relation_df, entity_description_df, entity_name_df, triple_id_df)
         triple_df = self.build_triples_with_descriptions(entity_description_df, entity_id_df, entity_name_df, relation_df,
                                                          triple_id_df)
         filtered_df = self.filter_triples_logically_before_join(triple_df)
-        merged_parent_child_df = pd.merge(filtered_df, filtered_df, on='HeadEntityID', suffixes=('_parent', '_child'))
-        # G
+
+        # def process_group(group):
+        #     # I need to do the cross-join within the group's apply to limit the size of the cartesian product
+
+        # Create a temporary key column for cross joining within each group
+        filtered_df['key'] = 1
+        merged_parent_child_df = pd.merge(filtered_df, filtered_df, on=['HeadEntityID', 'key'], suffixes=('_parent', '_child'))
+
+        # Drop the temporary 'key' column as it's no longer needed after merging
+        merged_parent_child_df.drop('key', axis=1, inplace=True)
+        filtered_df.drop('key', axis=1, inplace=True)
+
         filtered_parent_child_df = self.filter_parent_child_pairs_logically(merged_parent_child_df)
         grouped_df = filtered_parent_child_df.groupby("TailEntityID_parent")
-        contextualized_df = grouped_df.apply(build_context)
-        join back to filtered_df on both head and tail (separate left joins). Replace nan with ''
-        return contextualized_df
+        def build_context(group):
+            concatenated_result = ', '.join(group['RelationName_child'] + ' (' + group['EntityName_Tail_child'] + ')')
+            # Concatenate 'RelationName' and 'EntityName_Tail' with conditions
+            result_with_wrapper = "<context>" + concatenated_result[:context_text_length_max] + "</context>" if concatenated_result else ''
+            return pd.DataFrame({'HeadEntityID': group["HeadEntityID"].iloc[0], 'Context': [result_with_wrapper]})  # group.name assumes grouping by HeadEntityID
+        context_with_ids_df = grouped_df.apply(build_context).reset_index(drop=True)
+
+        # Rename the 'Context' column to 'HeadContext' for use in the first merge
+        context_with_head_ids_df = context_with_ids_df.rename(columns={'Context': 'HeadContext'})
+
+        # Perform the first merge
+        filtered_df_with_head_context = filtered_df.merge(context_with_head_ids_df, on="HeadEntityID", how="left")
+
+        # Rename the 'Context' column to 'TailContext' for use in the second merge
+        context_with_tail_ids_df = context_with_ids_df.rename(columns={'Context': 'TailContext', "HeadEntityID": "HeadEntityID_context"})
+
+        # Perform the second merge
+        filtered_df_with_head_and_tail_context = filtered_df_with_head_context.merge(context_with_tail_ids_df, left_on="TailEntityID", right_on="HeadEntityID_context", how="left")
+        filtered_df_with_head_and_tail_context.drop('HeadEntityID_context', axis=1, inplace=True)
+        filtered_df_with_head_and_tail_context.fillna('', inplace=True)
+
+        import numpy as np
+
+        # Vectorized function to check substring presence
+        def check_substring(company_name, context):
+            # Convert all elements to string ensuring no non-string types cause issues
+            str_context = np.array(list(map(str, context)))
+            str_company_name = np.array(list(map(str, company_name)))
+            result = np.char.find(str_context,str_company_name)
+            return result == -1  # Returns True where substring is not found
+
+        # Create mask for 'EntityName_Tail' in 'HeadContext'
+        condition1 = check_substring(filtered_df_with_head_and_tail_context['EntityName_Tail'], filtered_df_with_head_and_tail_context['HeadContext'])
+
+        # Create mask for 'EntityName_Head' in 'TailContext'
+        condition2 = check_substring(filtered_df_with_head_and_tail_context['EntityName_Head'], filtered_df_with_head_and_tail_context['TailContext'])
+
+        combined_conditions = condition1 & condition2
+        # Apply the masks using negation to filter out those rows
+        filtered_df_with_head_and_tail_context_filtered = filtered_df_with_head_and_tail_context[combined_conditions]
+        return filtered_df_with_head_and_tail_context_filtered
 
     def filter_parent_child_pairs_logically(self, merged_parent_child_df):
         # Now, we apply the filter criteria. We will roll up the child tails when neither the parent head nor parent tail
@@ -346,54 +394,6 @@ HeadEntityID\tRelationID\tTailEntityID
         filtered_merged_parent_child_df = merged_parent_child_df[~filter_condition]
 
         return filtered_merged_parent_child_df.reset_index(drop=True)
-    @DeprecationWarning
-    def prepare_wikidata5m_from_dfs_with_description_filter(self, relation_df, entity_description_df, entity_name_df, entity_id_df, triple_id_df):
-        triple_ids = self.build_triples_with_descriptions(entity_description_df, entity_id_df, entity_name_df, relation_df,
-                                                          triple_id_df)
-
-        # Create masks for each condition
-        condition1 = triple_ids['EntityName_Tail'] == triple_ids['EntityName_Head']
-        # Use apply to check substring presence, row by row
-        condition2 = triple_ids.apply(
-            lambda row: row['EntityName_Tail'].lower() in row['EntityDescription_Head'].lower(), axis=1)
-        condition3 = triple_ids.apply(
-            lambda row: row['EntityName_Head'].lower() in row['EntityDescription_Tail'].lower(), axis=1)
-        # Combine conditions using OR (|)
-        filter_condition = condition1 | condition2 | condition3
-        # Apply the filter with a negation to keep entries that do not meet any of the conditions
-        filtered_triple_ids = triple_ids[~filter_condition]
-
-        # Ensure that no concatenation results in 'nan'
-        def custom_concat_head(group):
-            # Fill NaN values in specific columns to avoid 'nan' in the output
-            group['RelationName'] = group['RelationName'].fillna('')
-            group['EntityName_Tail'] = group['EntityName_Tail'].fillna('')
-
-            # Apply the filters based on conditions specified in the comments
-            filtered_group = group[
-                ~group['EntityName_Head'].isin(group['EntityName_Tail']) &
-                ~group['EntityName_Head'].isin(group['EntityDescription_Tail']) &
-                ~group['EntityName_Tail'].apply(lambda x: x in group['EntityDescription_Head'].iloc[0] or x == group['EntityName_Head'].iloc[0] or x == group['EntityName_Tail'].iloc[0])
-                ]
-            concatenated_result = ', '.join(filtered_group['RelationName'] + ' (' + filtered_group['EntityName_Tail'] + ')')
-            # Concatenate 'RelationName' and 'EntityName_Tail' with conditions
-            return "<context>" + concatenated_result[:240] + "</context>" if concatenated_result else ''
-
-        # Group by HeadEntityID to concatenate relation names and tail entity names
-        grouped_head_df = filtered_triple_ids.groupby('HeadEntityID')
-        concatenated_head_data = grouped_head_df.apply(custom_concat_head).reset_index(name='Head1HopContext')
-        # Merge concatenated descriptions back to triple_ids
-        filtered_triple_ids_with_concat = filtered_triple_ids.merge(concatenated_head_data, on='HeadEntityID', how='left')
-
-        concatenated_tail_data = concatenated_head_data.rename(columns={
-            'HeadEntityID': 'TailEntityID',
-            'Head1HopContext': 'Tail1HopContext'
-        })
-        filtered_triple_ids_with_concat = filtered_triple_ids_with_concat.merge(concatenated_tail_data, on='TailEntityID', how='left').fillna('')
-
-        # Display the merged DataFrame
-        print(filtered_triple_ids_with_concat.head())
-        return filtered_triple_ids_with_concat
 
     def build_triples_with_descriptions(self, entity_description_df, entity_id_df, entity_name_df, relation_df, triple_id_df):
         # Merge entity information
@@ -418,23 +418,96 @@ HeadEntityID\tRelationID\tTailEntityID
         # entity_names = self.filter_by_deviation(entity_names, "EntityName", 3)
         # triple_ids = self.filter_by_group(triple_ids, "HeadEntityID", 'RelationID', 3)
         # (decided to just truncate text instead of removing the rows entirely, except for the rare excessively large groups)
-        relations["RelationName"] = relations["RelationName"].str[:25]
-        entity_names["EntityName"] = entity_names["EntityName"].str[:40]
-        entity_descriptions["EntityDescription"] = entity_descriptions["EntityDescription"].str[:200]
-        triple_ids = self.filter_by_group(triple_ids, "HeadEntityID", 'RelationID', 3)
+        relations["RelationName"] = relations["RelationName"].str[:relation_name_length_max]
+        entity_names["EntityName"] = entity_names["EntityName"].str[:entity_name_length_max]
+        entity_descriptions["EntityDescription"] = entity_descriptions["EntityDescription"].str[:entity_description_length_max]
+        triple_ids = self.filter_by_group(triple_ids, "HeadEntityID", 'RelationID', group_size_standard_deviation_max)
         return relations, entity_descriptions, entity_names, triple_ids
 
-    def test_entire_wikidata_pipeline(self):
-        split = "valid_tiny"
-        relations, entity_ids, entity_names, entity_descriptions, triple_ids = self.read_wikidata5m_files(split)
+    def build_training_labels(self, df):
+        mem_head = df.apply(lambda x: pd.Series({"source": f"<cls>predict head: Head: <head>. Relation: {x['relation']}. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
+                                                         "target": f"<head>{x['head']}<end>",
+                                                         "relation": x['relation'],
+                                                         "tail": x['tail'],
+                                                         "tail_description": x['tail_description'],
+                                                         "head": x['head'],
+                                                         "head_description": x['head_description'],
+                                                         "head_context": x['head_context'],
+                                                         "tail_context": x['tail_context'],
+                                                         "objective": "predict_head"
+                                                         }), axis=1)
+        mem_tail = df.apply(lambda x: pd.Series({"source": f"<cls>predict tail: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: {x['relation']}. Tail: <tail>",
+                                                         "target": f"<tail>{x['tail']}<end>",
+                                                         "relation": x['relation'],
+                                                         "tail": x['tail'],
+                                                         "tail_description": x['tail_description'],
+                                                         "head": x['head'],
+                                                         "head_description": x['head_description'],
+                                                         "head_context": x['head_context'],
+                                                         "tail_context": x['tail_context'],
+                                                         "objective": "predict_tail"
+                                                         }), axis=1)
 
-        relations, entity_descriptions, entity_names, triple_ids = self.trim_statistically(relations, entity_descriptions, entity_names, triple_ids)
-
-        new_df = self.prepare_fake_relation_data(relations, entity_ids, entity_names, entity_descriptions, triple_ids)
-
-        max_length = new_df['source'].apply(len).max()
+        mem_relation = df.apply(lambda x: pd.Series({"source": f"<cls>predict relation: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: <relation>. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
+                                                             "target": f"<relation>{x['relation']}<end>",
+                                                             "relation": x['relation'],
+                                                             "tail": x['tail'],
+                                                             "tail_description": x['tail_description'],
+                                                             "head": x['head'],
+                                                             "head_description": x['head_description'],
+                                                             "head_context": x['head_context'],
+                                                             "tail_context": x['tail_context'],
+                                                             "objective": "predict_relation"
+                                                             }), axis=1)
+        new_df = pd.concat([mem_head, mem_relation, mem_tail]).drop_duplicates().reset_index(drop=True)
+        return new_df
+    def test_entire_wikidata_pipeline_fake(self):
+        split = "fake"
+        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.get_fake_wikidata()
+        prepared_df = self.build_full_dataset(relation_df, entity_description_df, entity_name_df, entity_id_df, triple_id_df)
+        prepared_df = prepared_df.rename(columns={
+            'EntityName_Head': 'head',
+            'EntityDescription_Head': 'head_description',
+            'HeadContext': 'head_context',
+            'RelationName': 'relation',
+            'EntityName_Tail': 'tail',
+            'EntityDescription_Tail': 'tail_description',
+            'TailContext': 'tail_context'
+        })
+        training_set = self.build_training_labels(prepared_df)
+        max_length = training_set['source'].apply(len).max()
         print(f"max_length is: {max_length}")
-        shuffled_df = new_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+        shuffled_df = prepared_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+        # tokenizer = self.get_tokenizer()
+        # shuffled_df["source_tokenized"] = shuffled_df['source'].apply(lambda x: tokenizer.encode_plus(x, max_length=512, padding='max_length', truncation=True, return_tensors='pt')['input_ids'].squeeze().tolist())
+        # shuffled_df["attention_mask"] = shuffled_df["source_tokenized"].apply(lambda x: (torch.tensor(x).ne(tokenizer.pad_token_id)).tolist())
+        # shuffled_df["target_tokenized"] = shuffled_df['target'].apply(lambda x: tokenizer.encode_plus(x, max_length=512, padding='max_length', truncation=True, return_tensors='pt')['input_ids'].squeeze().tolist())
+
+        print(shuffled_df.head())
+        shuffled_df.to_parquet(f"data/wikidata5m_train_processed_filtered_{split}.parquet", engine='fastparquet')
+
+    def test_build_all_wikidata_splits(self):
+        self.build_entire_wikidata_pipeline_real("train")
+        self.build_entire_wikidata_pipeline_real("valid")
+        self.build_entire_wikidata_pipeline_real("test")
+        self.build_entire_wikidata_pipeline_real("valid_tiny")
+
+    def build_entire_wikidata_pipeline_real(self, split:str):
+        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.read_wikidata5m_files(split)
+        prepared_df = self.build_full_dataset(relation_df, entity_description_df, entity_name_df, entity_id_df, triple_id_df)
+        prepared_df = prepared_df.rename(columns={
+            'EntityName_Head': 'head',
+            'EntityDescription_Head': 'head_description',
+            'HeadContext': 'head_context',
+            'RelationName': 'relation',
+            'EntityName_Tail': 'tail',
+            'EntityDescription_Tail': 'tail_description',
+            'TailContext': 'tail_context'
+        })
+        training_set = self.build_training_labels(prepared_df)
+        max_length = training_set['source'].apply(len).max()
+        print(f"max_length is: {max_length}")
+        shuffled_df = prepared_df.sample(frac=1, random_state=seed).reset_index(drop=True)
         # tokenizer = self.get_tokenizer()
         # shuffled_df["source_tokenized"] = shuffled_df['source'].apply(lambda x: tokenizer.encode_plus(x, max_length=512, padding='max_length', truncation=True, return_tensors='pt')['input_ids'].squeeze().tolist())
         # shuffled_df["attention_mask"] = shuffled_df["source_tokenized"].apply(lambda x: (torch.tensor(x).ne(tokenizer.pad_token_id)).tolist())
@@ -454,22 +527,30 @@ HeadEntityID\tRelationID\tTailEntityID
     def test_fake_wikidata_pipeline_data_are_correct(self):
         import pyarrow as pa
         import pyarrow.parquet as pq
-        relations, entity_ids, entity_names, entity_descriptions, triple_ids = self.get_fake_wikidata()
-        new_df = self.prepare_fake_relation_data(relations, entity_ids, entity_names, entity_descriptions, triple_ids)
+        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.get_fake_wikidata()
+        prepared_df = self.build_full_dataset(relation_df, entity_description_df, entity_name_df, entity_id_df, triple_id_df)
+        prepared_df = prepared_df.rename(columns={
+            'EntityName_Head': 'head',
+            'EntityDescription_Head': 'head_description',
+            'HeadContext': 'head_context',
+            'RelationName': 'relation',
+            'EntityName_Tail': 'tail',
+            'EntityDescription_Tail': 'tail_description',
+            'TailContext': 'tail_context'
+        })
+        assert prepared_df["head"].iloc[1] == "Company C"
+        assert prepared_df["tail"].iloc[1] == "Company E"
+        assert prepared_df["head_context"].iloc[1] == "<context>competes with (Company F)</context>"
+        assert prepared_df["tail"].iloc[5] == "Company F"
+        assert prepared_df["head_context"].iloc[5] == "<context>partners with (Company E)</context>"
+        assert prepared_df["tail_context"].iloc[6] == "<context>partners with (Company D), competes with (Company E)</context>"
+        assert prepared_df["head_context"].iloc[0] == ""
+        assert prepared_df["tail_context"].iloc[0] == "" # because the only relation of Company D has Company A in the description
+        assert prepared_df["tail_context"].iloc[2] == ""
+        assert prepared_df["tail_description"].iloc[3].str.contains("Company A")
 
-        assert new_df["EntityName_Head"].iloc[1] == "Company C"
-        assert new_df["EntityName_Tail"].iloc[1] == "Company E"
-        assert new_df["Head1HopContext"].iloc[1] == "<context>competes with (Company F)</context>"
-        assert new_df["EntityName_Tail"].iloc[5] == "Company F"
-        assert new_df["Head1HopContext"].iloc[5] == "<context>partners with (Company E)</context>"
-        assert new_df["Tail1HopContext"].iloc[6] == "<context>partners with (Company E), competes with (Company F)</context>"
-        assert new_df["Head1HopContext"].iloc[0] == ""
-        assert new_df["Tail1HopContext"].iloc[0] == "" # because the only relation of Company D has Company A in the description
-        assert new_df["Tail1HopContext"].iloc[2] == ""
-        assert new_df["EntityDescription_Tail"].iloc[3].str.contains("Company A")
 
-
-
+    @DeprecationWarning
     def test_fake_wikidata_pipeline_can_read_serialized(self):
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -491,119 +572,4 @@ HeadEntityID\tRelationID\tTailEntityID
         original_dtype = torch.long
         original_shape = [512]
         serialized_tensor = torch.tensor(written_df.iloc[0]['source_tokenized'])
-        print(tensor_restored)
-
-    def prepare_fake_relation_data(self, relations, entity_ids, entity_names, entity_descriptions, triple_ids):
-
-        df = self.prepare_wikidata5m_from_dfs_with_description_filter(relations, entity_descriptions, entity_names, entity_ids, triple_ids)
-        df_renamed = df.rename(columns={
-            'EntityName_Head': 'head',
-            'EntityDescription_Head': 'head_description',
-            'Head1HopContext': 'head_context',
-            'RelationName': 'relation',
-            'EntityName_Tail': 'tail',
-            'EntityDescription_Tail': 'tail_description',
-            'Tail1HopContext': 'tail_context'
-        })
-        # 'EntityName_Head', 'EntityDescription_Head', 'RelationID', 'RelationName', 'TailEntityID', 'QID_Tail','EntityName_Tail', 'EntityDescription_Tail'
-        mem_head = df_renamed.apply(lambda x: pd.Series({"source": f"<cls>predict head: Head: <head>. Relation: {x['relation']}. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
-                                                     "target": f"<head>{x['head']}<end>",
-                                                     "relation": x['relation'],
-                                                     "tail": x['tail'],
-                                                     "tail_description": x['tail_description'],
-                                                     "head": x['head'],
-                                                     "head_description": x['head_description'],
-                                                     "head_context": x['head_context'],
-                                                     "tail_context": x['tail_context'],
-                                                     "objective": "predict_head"
-                                                     }), axis=1)
-        mem_tail = df_renamed.apply(lambda x: pd.Series({"source": f"<cls>predict tail: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: {x['relation']}. Tail: <tail>",
-                                                     "target": f"<tail>{x['tail']}<end>",
-                                                     "relation": x['relation'],
-                                                     "tail": x['tail'],
-                                                     "tail_description": x['tail_description'],
-                                                     "head": x['head'],
-                                                     "head_description": x['head_description'],
-                                                     "head_context": x['head_context'],
-                                                     "tail_context": x['tail_context'],
-                                                     "objective": "predict_tail"
-                                                     }), axis=1)
-
-        mem_relation = df_renamed.apply(lambda x: pd.Series({"source": f"<cls>predict relation: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: <relation>. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
-                                                     "target": f"<relation>{x['relation']}<end>",
-                                                     "relation": x['relation'],
-                                                     "tail": x['tail'],
-                                                     "tail_description": x['tail_description'],
-                                                     "head": x['head'],
-                                                     "head_description": x['head_description'],
-                                                     "head_context": x['head_context'],
-                                                     "tail_context": x['tail_context'],
-                                                     "objective": "predict_relation"
-                                                     }), axis=1)
-        new_df = pd.concat([mem_head, mem_relation, mem_tail]).drop_duplicates().reset_index(drop=True)
-        return new_df
-
-    def prepare_wikidata5m_from_dfs(self, relation_df, entity_description_df, entity_name_df, entity_id_df, triple_id_df):
-        # Merge entity information
-        entities = pd.merge(entity_id_df, entity_name_df, on='QID')
-        entities = entities.set_index('EntityID').join(entity_description_df)
-        # Enhance triple_ids with entity names and descriptions
-        triple_ids = triple_id_df.merge(entities.add_suffix('_Head'), left_on='HeadEntityID', right_index=True)
-        triple_ids = triple_ids.merge(entities.add_suffix('_Tail'), left_on='TailEntityID', right_index=True)
-        triple_ids = triple_ids.merge(relation_df, on='RelationID')
-        triple_ids = triple_ids[['HeadEntityID', 'QID_Head', 'EntityName_Head', 'EntityDescription_Head', 'RelationID', 'RelationName', 'TailEntityID', 'QID_Tail','EntityName_Tail', 'EntityDescription_Tail']]
-        # Fill NaN with empty strings and convert all data to strings to avoid type issues
-        columns_to_fill = ['RelationName', 'EntityName_Tail', 'EntityName_Head', 'EntityDescription_Tail',
-                           'EntityDescription_Head']
-        for col in columns_to_fill:
-            triple_ids[col] = triple_ids[col].fillna('').astype(str)
-        # Create masks for each condition
-        condition1 = triple_ids['EntityName_Tail'] == triple_ids['EntityName_Head']
-        # Use apply to check substring presence, row by row
-        condition2 = triple_ids.apply(
-            lambda row: row['EntityName_Tail'].lower() in row['EntityDescription_Head'].lower(), axis=1)
-        condition3 = triple_ids.apply(
-            lambda row: row['EntityName_Head'].lower() in row['EntityDescription_Tail'].lower(), axis=1)
-        # Combine conditions using OR (|)
-        filter_condition = condition1 | condition2 | condition3
-        # Apply the filter with a negation to keep entries that do not meet any of the conditions
-        filtered_triple_ids = triple_ids[~filter_condition]
-
-        # Ensure that no concatenation results in 'nan'
-        def custom_concat_head(group):
-            # Apply the filters based on conditions specified in the comments
-            filtered_group = group[
-                ~group['EntityName_Head'].isin(group['EntityName_Tail']) &
-                ~group['EntityName_Head'].isin(group['EntityDescription_Tail']) &
-                ~group['EntityName_Tail'].apply(lambda x: x in group['EntityDescription_Head'].iloc[0] or x == group['EntityName_Head'].iloc[0])
-                ]
-            # Concatenate 'RelationName' and 'EntityName_Tail' with conditions
-            return ', '.join(filtered_group['RelationName'] + ' (' + filtered_group['EntityName_Tail'] + "<tail_description>" + filtered_group['EntityDescription_Tail'] + "</tail_description>" + ')')
-
-        def custom_concat_tail(group):
-            # Apply the filters based on conditions specified in the comments
-            filtered_group = group[
-                ~group['EntityName_Tail'].isin(group['EntityName_Head']) &
-                ~group['EntityName_Tail'].isin(group['EntityDescription_Head']) &
-                ~group['EntityName_Head'].apply(lambda x: x in group['EntityDescription_Tail'].iloc[0] or x == group['EntityName_Tail'].iloc[0])
-                ]
-            # Concatenate 'RelationName' and 'EntityName_Tail' with conditions
-            return ', '.join(filtered_group['RelationName'] + ' (' + filtered_group['EntityName_Tail'] + "<tail_description>" + filtered_group['EntityDescription_Tail'] + "</tail_description>" + ')')
-
-        # Then, we must filter out rows where
-
-        # Group by HeadEntityID to concatenate relation names and tail entity names
-        grouped_head_df = filtered_triple_ids.groupby('HeadEntityID')
-        concatenated_head_data = grouped_head_df.apply(custom_concat_head).reset_index(name='Head1HopContext')
-        # Merge concatenated descriptions back to triple_ids
-        triple_ids = triple_ids.merge(concatenated_head_data, on='HeadEntityID', how='left')
-
-        grouped_tail_df = filtered_triple_ids.groupby('TailEntityID')
-        concatenated_tail_data = grouped_tail_df.apply(custom_concat_tail).reset_index(name='Tail1HopContext')
-        # Merge concatenated descriptions back to triple_ids
-        triple_ids = triple_ids.merge(concatenated_tail_data, on='TailEntityID', how='left')
-
-        # Display the merged DataFrame
-        print(triple_ids.head())
-        return triple_ids
-        #triple_ids.to_parquet(f"data/wikidata5m_train_processed_{source_file}.parquet", engine='fastparquet')
+        #print(tensor_restored)

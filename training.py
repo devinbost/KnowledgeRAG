@@ -75,8 +75,8 @@ class Part(BaseModel):
 class KBDataset(Dataset):
     def __init__(self, tokenizer, df, num_entities, max_length=vector_length):
         self.tokenizer = tokenizer
-        self.source_rows = df['Source']
-        self.target_rows = df['Target']
+        self.source_rows = df['source']
+        self.target_rows = df['target']
         self.max_length = max_length
         self.num_entities = num_entities
         self.df = df
@@ -85,8 +85,8 @@ class KBDataset(Dataset):
         return len(self.source_rows)
 
     def __getitem__(self, idx):
-        source = self.df['Source'][idx]
-        target = self.df['Target'][idx]
+        source = self.df['source'][idx]
+        target = self.df['target'][idx]
         relation = self.df['relation'][idx]
         tail = self.df['tail'][idx]
         tail_description = self.df['tail_description'][idx]
@@ -365,8 +365,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
         return source_text, target_text
 
     def prepare_dataset(self, df):
-        mem_head = df.apply(lambda x: pd.Series({"Source": f"<cls>predict head: Head: <head>. Relation: {x['relation']}. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
-                                                     "Target": f"<head>{x['head']}<end>",
+        mem_head = df.apply(lambda x: pd.Series({"source": f"<cls>predict head: Head: <head>. Relation: {x['relation']}. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
+                                                     "target": f"<head>{x['head']}<end>",
                                                      "relation": x['relation'],
                                                      "tail": x['tail'],
                                                      "tail_description": x['tail_description'],
@@ -374,8 +374,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
                                                      "head_description": x['head_description'],
                                                      "objective": "predict_head"
                                                      }), axis=1)
-        mem_tail = df.apply(lambda x: pd.Series({"Source": f"<cls>predict tail: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: {x['relation']}. Tail: <tail>",
-                                                     "Target": f"<tail>{x['tail']}<end>",
+        mem_tail = df.apply(lambda x: pd.Series({"source": f"<cls>predict tail: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: {x['relation']}. Tail: <tail>",
+                                                     "target": f"<tail>{x['tail']}<end>",
                                                      "relation": x['relation'],
                                                      "tail": x['tail'],
                                                      "tail_description": x['tail_description'],
@@ -384,8 +384,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
                                                      "objective": "predict_tail"
                                                      }), axis=1)
 
-        # mem_tail_plain = df.apply(lambda x: pd.Series({"Source": f"<cls>predict tail: {x['head']}, {x['head_description']}. {x['relation']}",
-        #                                              "Target": f"{x['tail']}",
+        # mem_tail_plain = df.apply(lambda x: pd.Series({"source": f"<cls>predict tail: {x['head']}, {x['head_description']}. {x['relation']}",
+        #                                              "target": f"{x['tail']}",
         #                                              "relation": x['relation'],
         #                                              "tail": x['tail'],
         #                                              "tail_description": x['tail_description'],
@@ -400,8 +400,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
             words_to_delete = np.random.choice(words, n_to_delete, replace=False)
             return ' '.join(word for word in words if word not in words_to_delete)
         
-        # mem_tail_plain_deletes = df.apply(lambda x: pd.Series({"Source": f"<cls>predict tail: {x['head']}, {x['head_description']}. {x['relation']}",
-        #                                              "Target": f"{x['tail']}",
+        # mem_tail_plain_deletes = df.apply(lambda x: pd.Series({"source": f"<cls>predict tail: {x['head']}, {x['head_description']}. {x['relation']}",
+        #                                              "target": f"{x['tail']}",
         #                                              "relation": x['relation'],
         #                                              "tail": x['tail'],
         #                                              "tail_description": x['tail_description'],
@@ -410,7 +410,7 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
         #                                              "objective": "predict_tail"
         #                                              }), axis=1)
         
-        # mem_tail_plain_deletes['Source'] = mem_tail_plain_deletes['Source'].apply(randomly_delete_words)
+        # mem_tail_plain_deletes['source'] = mem_tail_plain_deletes['source'].apply(randomly_delete_words)
 
         # loop = asyncio.new_event_loop()
         # asyncio.set_event_loop(loop)
@@ -421,8 +421,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
         #     # Close the loop to clean up
         #     loop.close()
 
-        mem_relation = df.apply(lambda x: pd.Series({"Source": f"<cls>predict relation: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: <relation>. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
-                                                     "Target": f"<relation>{x['relation']}<end>",
+        mem_relation = df.apply(lambda x: pd.Series({"source": f"<cls>predict relation: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: <relation>. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
+                                                     "target": f"<relation>{x['relation']}<end>",
                                                      "relation": x['relation'],
                                                      "tail": x['tail'],
                                                      "tail_description": x['tail_description'],
@@ -433,8 +433,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
         
         def process_row15(x):
             source, target = self.generate_word_masks(x['head'], x['head_description'], x['relation'], x['tail'], x['tail_description'], 15)
-            return pd.Series({"Source": source, 
-                                "Target": target,
+            return pd.Series({"source": source, 
+                                "target": target,
                                 "relation": x['relation'],
                                 "tail": x['tail'],
                                 "tail_description": x['tail_description'],
@@ -629,7 +629,7 @@ class KBModel(pl.LightningModule):
             batch_df = filtered_df.iloc[start_idx:end_idx]
             
             # Prepare batch data
-            sources = batch_df['Source'].tolist()
+            sources = batch_df['source'].tolist()
             tokenized_input = self.tokenizer(sources, return_tensors='pt', padding=True, truncation=True, max_length=512).to('cuda')
             input_ids = tokenized_input['input_ids'].to('cuda')
             attention_mask = tokenized_input['attention_mask'].to('cuda')
@@ -674,7 +674,7 @@ class KBModel(pl.LightningModule):
     #         batch_df = filtered_df.iloc[start_idx:end_idx]
             
     #         # Prepare batch data
-    #         sources = batch_df['Source'].tolist()
+    #         sources = batch_df['source'].tolist()
     #         tokenized_input = self.tokenizer(sources, return_tensors='pt', padding=True, truncation=True, max_length=512).to('cuda')
     #         input_ids = tokenized_input['input_ids'].to('cuda')
     #         attention_mask = tokenized_input['attention_mask'].to('cuda')
