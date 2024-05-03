@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 from cassandra.concurrent import execute_concurrent_with_args
+from tqdm import tqdm
 from transformers import T5Tokenizer
 
 from core.ConfigLoader import ConfigLoader
@@ -296,11 +297,13 @@ HeadEntityID\tRelationID\tTailEntityID
         filter_condition = condition1 | condition2 | condition3 | condition4
         # Apply the filter with a negation to keep entries that do not meet any of the conditions
         filtered_triple_ids = triple_df[~filter_condition]
+        print("DF filtered logically")
 
         return filtered_triple_ids.reset_index(drop=True)
 
     def build_triples_with_descriptions(self, entity_description_df, entity_id_df, entity_name_df, relation_df, triple_id_df):
         # Merge entity information
+        print("Merging dataframes from source files")
         entities = pd.merge(entity_id_df, entity_name_df, on='QID')
         entities = entities.set_index('EntityID').join(entity_description_df)
         # Enhance triple_ids with entity names and descriptions
@@ -315,6 +318,7 @@ HeadEntityID\tRelationID\tTailEntityID
                            'EntityDescription_Head']
         for col in columns_to_fill:
             triple_ids[col] = triple_ids[col].fillna('').astype(str)
+        print("built df of quintuples")
         return triple_ids
     def trim_statistically_and_truncate(self, relations, entity_descriptions, entity_names, triple_ids):
         # relations = self.filter_by_deviation(relations, "RelationName", 3)
@@ -365,30 +369,6 @@ HeadEntityID\tRelationID\tTailEntityID
                                                              }), axis=1)
         new_df = pd.concat([mem_head, mem_tail, mem_relation]).drop_duplicates().reset_index(drop=True)
         return new_df
-    def test_entire_wikidata_pipeline_fake(self):
-        split = "fake"
-        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.get_fake_wikidata()
-        prepared_df = self.build_full_dataset(relation_df, entity_description_df, entity_name_df, entity_id_df, triple_id_df)
-        prepared_df = prepared_df.rename(columns={
-            'EntityName_Head': 'head',
-            'EntityDescription_Head': 'head_description',
-            'HeadContext': 'head_context',
-            'RelationName': 'relation',
-            'EntityName_Tail': 'tail',
-            'EntityDescription_Tail': 'tail_description',
-            'TailContext': 'tail_context'
-        })
-        training_set = self.build_training_labels(prepared_df)
-        max_length = training_set['source'].apply(len).max()
-        print(f"max_length is: {max_length}")
-        shuffled_df = prepared_df.sample(frac=1, random_state=seed).reset_index(drop=True)
-        # tokenizer = self.get_tokenizer()
-        # shuffled_df["source_tokenized"] = shuffled_df['source'].apply(lambda x: tokenizer.encode_plus(x, max_length=512, padding='max_length', truncation=True, return_tensors='pt')['input_ids'].squeeze().tolist())
-        # shuffled_df["attention_mask"] = shuffled_df["source_tokenized"].apply(lambda x: (torch.tensor(x).ne(tokenizer.pad_token_id)).tolist())
-        # shuffled_df["target_tokenized"] = shuffled_df['target'].apply(lambda x: tokenizer.encode_plus(x, max_length=512, padding='max_length', truncation=True, return_tensors='pt')['input_ids'].squeeze().tolist())
-
-        print(shuffled_df.head())
-        shuffled_df.to_parquet(f"data/wikidata5m_train_processed_filtered_{split}.parquet", engine='fastparquet')
 
     def test_build_all_wikidata_splits(self):
         print("Starting validation tiny data prep.")
@@ -400,18 +380,27 @@ HeadEntityID\tRelationID\tTailEntityID
         print("Starting training data prep.")
         #self.build_entire_wikidata_pipeline_real("train")
 
-    def test_inspect_source_length_of_training_set(self):
-        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.read_wikidata5m_files("train")
+    def build_graph_dfs_from_split(self, split: str):
+        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.read_wikidata5m_files(split)
         relation_df, entity_description_df, entity_name_df, triple_id_df = self.trim_statistically_and_truncate(relation_df, entity_description_df, entity_name_df, triple_id_df)
         triple_df = self.build_triples_with_descriptions(entity_description_df, entity_id_df, entity_name_df, relation_df,
                                                          triple_id_df)
         prefiltered_df = self.filter_triples_logically_before_join(triple_df)
         graph = self.build_networkx_graph(prefiltered_df)
         results_df, results_annotated_df = self.filter_adjacent_nodes(graph)
-        results_annotated_df = results_df[['head', 'head_description', 'relation', 'tail', 'tail_description', 'head_context', 'tail_context', 'source', 'target', 'objective']]
+        # Order the columns to make dataframe easier to work with:
+        results_annotated_df = results_annotated_df[['head', 'head_description', 'relation', 'tail', 'tail_description', 'head_context', 'tail_context', 'source', 'target', 'objective']]
+        print("returning from build_graph_dfs_from_split(..)")
+        return results_df, results_annotated_df
+    def test_inspect_source_length_of_training_set(self):
+        results_df, results_annotated_df = self.build_graph_dfs_from_split("valid_tiny")
         # Calculate the length of each string in the 'source' column
         # Calculate the length of each string in the 'source' and 'target' columns
+        print("Computing lengths")
         source_lengths = results_annotated_df['source'].str.len()
+        print("Computing max length of source")
+        max_length = results_annotated_df['source'].apply(len).max() # need to replace with truncation step?
+        print(f"max_length is: {max_length}")
         target_lengths = results_annotated_df['target'].str.len()
 
         # Set up the figure with two subplots
@@ -445,18 +434,17 @@ HeadEntityID\tRelationID\tTailEntityID
         return tokenizer
 
     def build_entire_pipeline_real(self, split: str):
-        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.read_wikidata5m_files(split)
-        relation_df, entity_description_df, entity_name_df, triple_id_df = self.trim_statistically_and_truncate(relation_df, entity_description_df, entity_name_df, triple_id_df)
-        triple_df = self.build_triples_with_descriptions(entity_description_df, entity_id_df, entity_name_df, relation_df,
-                                                         triple_id_df)
-        prefiltered_df = self.filter_triples_logically_before_join(triple_df)
-        graph = self.build_networkx_graph(prefiltered_df)
-        results_df, results_annotated_df = self.filter_adjacent_nodes(graph)
-        results_annotated_df = results_df[['head', 'head_description', 'relation', 'tail', 'tail_description', 'head_context', 'tail_context', 'source', 'target', 'objective']]
-        max_length = results_annotated_df['source'].apply(len).max()
-        print(f"max_length is: {max_length}")
+        print(f"Processing {split}")
+        results_df, results_annotated_df = self.build_graph_dfs_from_split(split)
+        print("Computing source length")
+        max_length_source = results_annotated_df['source'].apply(len).max() # need to replace with truncation step?
+        print(f"max length of source text is: {max_length_source}")
+        max_length_target = results_annotated_df['target'].apply(len).max()
+        print(f"max length of target text is: {max_length_target}")
         shuffled_df = results_annotated_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+        print(f"Writing file")
         shuffled_df.to_parquet(f"data/wikidata5m_train_processed_filtered_{split}.parquet", engine='fastparquet')
+        print(f"Done processing {split}")
 
     def test_graph_building(self):
 
@@ -586,19 +574,30 @@ HeadEntityID\tRelationID\tTailEntityID
             edge_attr='RelationName',
             create_using=nx.MultiDiGraph()
         )
-
+        print("Built graph from pandas edge list. Adding node attributes next.")
         # Add node attributes for head entities
-        for _, row in dataframe.iterrows():
-            G.nodes[row['HeadEntityID']].update({
+        # Prepare updates for head entities
+        head_updates = {
+            row['HeadEntityID']: {
                 'EntityName': row['EntityName_Head'],
                 'EntityDescription': row['EntityDescription_Head']
-            })
+            } for _, row in tqdm(dataframe.iterrows(), total=dataframe.shape[0], desc="Preparing head entities")
+        }
 
-            # Add node attributes for tail entities
-            G.nodes[row['TailEntityID']].update({
+        # Prepare updates for tail entities
+        tail_updates = {
+            row['TailEntityID']: {
                 'EntityName': row['EntityName_Tail'],
                 'EntityDescription': row['EntityDescription_Tail']
-            })
+            } for _, row in tqdm(dataframe.iterrows(), total=dataframe.shape[0], desc="Preparing tail entities")
+        }
+
+        # Apply updates to the graph
+        for node_id, attributes in tqdm(head_updates.items(), desc="Updating head nodes"):
+            G.nodes[node_id].update(attributes)
+
+        for node_id, attributes in tqdm(tail_updates.items(), desc="Updating tail nodes"):
+            G.nodes[node_id].update(attributes)
         return G
 
     def build_node_context(self, G, source_node_id, target_node_id):
@@ -635,7 +634,7 @@ HeadEntityID\tRelationID\tTailEntityID
         results_annotated = []
         results = []
         # Iterate over each pair of nodes
-        for H, T in G.edges():
+        for H, T in tqdm(G.edges(), total=G.number_of_edges(), desc="Processing edges"):
             head_data = G.nodes[H]
             tail_data = G.nodes[T]
 
@@ -706,4 +705,5 @@ HeadEntityID\tRelationID\tTailEntityID
                     })
         results_annotated_df = pd.DataFrame(results_annotated).drop_duplicates().reset_index(drop=True)
         results_df = pd.DataFrame(results).drop_duplicates().reset_index(drop=True)
+        print("Dropped duplicates")
         return results_df, results_annotated_df
