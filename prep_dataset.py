@@ -363,7 +363,7 @@ HeadEntityID\tRelationID\tTailEntityID
                                                              "tail_context": x['tail_context'],
                                                              "objective": "predict_relation"
                                                              }), axis=1)
-        new_df = pd.concat([mem_head, mem_relation, mem_tail]).drop_duplicates().reset_index(drop=True)
+        new_df = pd.concat([mem_head, mem_tail, mem_relation]).drop_duplicates().reset_index(drop=True)
         return new_df
     def test_entire_wikidata_pipeline_fake(self):
         split = "fake"
@@ -392,37 +392,49 @@ HeadEntityID\tRelationID\tTailEntityID
 
     def test_build_all_wikidata_splits(self):
         print("Starting validation tiny data prep.")
-        self.build_entire_wikidata_pipeline_real("valid_tiny")
+        self.build_entire_pipeline_real("valid_tiny")
         print("Starting validation data prep.")
-        self.build_entire_wikidata_pipeline_real("valid")
+        self.build_entire_pipeline_real("valid")
         print("Starting test data prep.")
-        self.build_entire_wikidata_pipeline_real("test")
+        self.build_entire_pipeline_real("test")
         print("Starting training data prep.")
         #self.build_entire_wikidata_pipeline_real("train")
 
-    def build_entire_wikidata_pipeline_real(self, split:str):
-        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.read_wikidata5m_files(split)
-        prepared_df = self.build_full_dataset(relation_df, entity_description_df, entity_name_df, entity_id_df, triple_id_df)
-        prepared_df = prepared_df.rename(columns={
-            'EntityName_Head': 'head',
-            'EntityDescription_Head': 'head_description',
-            'HeadContext': 'head_context',
-            'RelationName': 'relation',
-            'EntityName_Tail': 'tail',
-            'EntityDescription_Tail': 'tail_description',
-            'TailContext': 'tail_context'
-        })
-        training_set = self.build_training_labels(prepared_df)
-        max_length = training_set['source'].apply(len).max()
-        print(f"max_length is: {max_length}")
-        shuffled_df = prepared_df.sample(frac=1, random_state=seed).reset_index(drop=True)
-        # tokenizer = self.get_tokenizer()
-        # shuffled_df["source_tokenized"] = shuffled_df['source'].apply(lambda x: tokenizer.encode_plus(x, max_length=512, padding='max_length', truncation=True, return_tensors='pt')['input_ids'].squeeze().tolist())
-        # shuffled_df["attention_mask"] = shuffled_df["source_tokenized"].apply(lambda x: (torch.tensor(x).ne(tokenizer.pad_token_id)).tolist())
-        # shuffled_df["target_tokenized"] = shuffled_df['target'].apply(lambda x: tokenizer.encode_plus(x, max_length=512, padding='max_length', truncation=True, return_tensors='pt')['input_ids'].squeeze().tolist())
+    def test_inspect_source_length_of_training_set(self):
+        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.read_wikidata5m_files("train")
+        relation_df, entity_description_df, entity_name_df, triple_id_df = self.trim_statistically_and_truncate(relation_df, entity_description_df, entity_name_df, triple_id_df)
+        triple_df = self.build_triples_with_descriptions(entity_description_df, entity_id_df, entity_name_df, relation_df,
+                                                         triple_id_df)
+        prefiltered_df = self.filter_triples_logically_before_join(triple_df)
+        graph = self.build_networkx_graph(prefiltered_df)
+        results_df, results_annotated_df = self.filter_adjacent_nodes(graph)
+        results_annotated_df = results_df[['head', 'head_description', 'relation', 'tail', 'tail_description', 'head_context', 'tail_context', 'source', 'target', 'objective']]
+        # Calculate the length of each string in the 'source' column
+        # Calculate the length of each string in the 'source' and 'target' columns
+        source_lengths = results_annotated_df['source'].str.len()
+        target_lengths = results_annotated_df['target'].str.len()
 
-        print(shuffled_df.head())
-        shuffled_df.to_parquet(f"data/wikidata5m_train_processed_filtered_{split}.parquet", engine='fastparquet')
+        # Set up the figure with two subplots
+        plt.figure(figsize=(12, 6))
+
+        # Histogram for the 'source' column
+        plt.subplot(1, 2, 1)  # 1 row, 2 columns, 1st subplot
+        plt.hist(source_lengths, bins=30, color='blue', edgecolor='black')
+        plt.title('Histogram of Source Lengths')
+        plt.xlabel('Length of Source')
+        plt.ylabel('Frequency')
+        plt.grid(True)
+
+        # Histogram for the 'target' column
+        plt.subplot(1, 2, 2)  # 1 row, 2 columns, 2nd subplot
+        plt.hist(target_lengths, bins=30, color='green', edgecolor='black')
+        plt.title('Histogram of Target Lengths')
+        plt.xlabel('Length of Target')
+        plt.grid(True)
+
+        # Display the plots
+        plt.tight_layout()  # Adjusts subplot params so that the subplot(s) fits in to the figure area.
+        plt.show()
 
     def get_tokenizer(self):
         tokenizer = T5Tokenizer.from_pretrained('t5-small')
@@ -440,7 +452,9 @@ HeadEntityID\tRelationID\tTailEntityID
         prefiltered_df = self.filter_triples_logically_before_join(triple_df)
         graph = self.build_networkx_graph(prefiltered_df)
         results_df, results_annotated_df = self.filter_adjacent_nodes(graph)
-        results_annotated_df = results_df[['head', 'head_description', 'relation', 'tail', 'tail_description', 'head_context', 'tail_context']]
+        results_annotated_df = results_df[['head', 'head_description', 'relation', 'tail', 'tail_description', 'head_context', 'tail_context', 'source', 'target', 'objective']]
+        max_length = results_annotated_df['source'].apply(len).max()
+        print(f"max_length is: {max_length}")
         shuffled_df = results_annotated_df.sample(frac=1, random_state=seed).reset_index(drop=True)
         shuffled_df.to_parquet(f"data/wikidata5m_train_processed_filtered_{split}.parquet", engine='fastparquet')
 
@@ -530,6 +544,38 @@ HeadEntityID\tRelationID\tTailEntityID
         assert results_df.iloc[8]['tail_context'] == '<context>competes with (Company D), partners with (Company E)</context>'
         print(results_df.head())
 
+        assert results_annotated_df.iloc[0]['head'] == 'Company A'
+        assert results_annotated_df.iloc[0]['head_description'] == 'Tech firm'
+        assert results_annotated_df.iloc[0]['relation'] == 'merged with'
+        assert results_annotated_df.iloc[0]['tail'] == 'Company B'
+        assert results_annotated_df.iloc[0]['tail_description'] == 'Startup that works with Company C. Similar to company F'
+        assert results_annotated_df.iloc[0]['head_context'] == '<context>partners with (Company D), merged with (Company D)</context>'
+        assert results_annotated_df.iloc[0]['tail_context'] == ''
+        assert results_annotated_df.iloc[0]['source'] == '<cls>predict head: Head: <head>. Relation: merged with. Tail: Company B<tail_description>Startup that works with Company C. Similar to company F</tail_description>'
+        assert results_annotated_df.iloc[0]['target'] == '<head>Company A<end>'
+        assert results_annotated_df.iloc[0]['objective'] == 'predict_head'
+
+        assert results_annotated_df.iloc[1]['head'] == 'Company A'
+        assert results_annotated_df.iloc[1]['head_description'] == 'Tech firm'
+        assert results_annotated_df.iloc[1]['relation'] == 'merged with'
+        assert results_annotated_df.iloc[1]['tail'] == 'Company B'
+        assert results_annotated_df.iloc[1]['tail_description'] == 'Startup that works with Company C. Similar to company F'
+        assert results_annotated_df.iloc[1]['head_context'] == '<context>partners with (Company D), merged with (Company D)</context>'
+        assert results_annotated_df.iloc[1]['tail_context'] == ''
+        assert results_annotated_df.iloc[1]['source'] == '<cls>predict tail: Head: Company A<head_description>Tech firm</head_description>Relation: merged with. Tail: <tail>'
+        assert results_annotated_df.iloc[1]['target'] == '<tail>Company B<end>'
+        assert results_annotated_df.iloc[1]['objective'] == 'predict_tail'
+
+        assert results_annotated_df.iloc[2]['head'] == 'Company A'
+        assert results_annotated_df.iloc[2]['head_description'] == 'Tech firm'
+        assert results_annotated_df.iloc[2]['relation'] == 'merged with'
+        assert results_annotated_df.iloc[2]['tail'] == 'Company B'
+        assert results_annotated_df.iloc[2]['tail_description'] == 'Startup that works with Company C. Similar to company F'
+        assert results_annotated_df.iloc[2]['head_context'] == '<context>partners with (Company D), merged with (Company D)</context>'
+        assert results_annotated_df.iloc[2]['tail_context'] == ''
+        assert results_annotated_df.iloc[2]['source'] == '<cls>predict relation: Head: Company A<head_description>Tech firm</head_description>Relation: <relation>. Tail: Company B<tail_description>Startup that works with Company C. Similar to company F</tail_description>'
+        assert results_annotated_df.iloc[2]['target'] == '<relation>merged with<end>'
+        assert results_annotated_df.iloc[2]['objective'] == 'predict_relation'
 
     def build_networkx_graph(self, dataframe):
         # Create the graph
@@ -647,7 +693,7 @@ HeadEntityID\tRelationID\tTailEntityID
                     # Predict relation objective:
 
                     results_annotated.append({
-                        'source': f"<cls>predict relation: Head: {head_data['EntityName']}<head_description>{head_data['EntityName']}</head_description>Relation: <relation>. Tail: {tail_data['EntityName']}<tail_description>{tail_data['EntityDescription']}</tail_description>",
+                        'source': f"<cls>predict relation: Head: {head_data['EntityName']}<head_description>{head_data['EntityDescription']}</head_description>Relation: <relation>. Tail: {tail_data['EntityName']}<tail_description>{tail_data['EntityDescription']}</tail_description>",
                         "target": f"<relation>{relation}<end>",
                         'head': head_data['EntityName'],
                         'head_description': head_data['EntityDescription'],
