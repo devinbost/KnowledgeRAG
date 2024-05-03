@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from typing import List, Optional
 import matplotlib.pyplot as plt
+import networkx as nx
 
 import numpy as np
 import pandas as pd
@@ -93,7 +94,9 @@ HeadEntityID\tRelationID\tTailEntityID
 6\t5\t1
 6\t5\t3
 3\t3\t4
+
                 """)
+# 4\t1\t3
 
         # Reading simulated data
         relations = pd.read_csv(relations_data, sep='\t')
@@ -299,69 +302,137 @@ HeadEntityID\tRelationID\tTailEntityID
         relation_df, entity_description_df, entity_name_df, triple_id_df = self.trim_statistically(relation_df, entity_description_df, entity_name_df, triple_id_df)
         triple_df = self.build_triples_with_descriptions(entity_description_df, entity_id_df, entity_name_df, relation_df,
                                                          triple_id_df)
-        filtered_df = self.filter_triples_logically_before_join(triple_df)
+        return self.filter_extract_and_aggregate(triple_df)
 
+    def filter_extract_and_aggregate(self, triple_df):
+        filtered_df = self.filter_triples_logically_before_join(triple_df)
         # def process_group(group):
         #     # I need to do the cross-join within the group's apply to limit the size of the cartesian product
-
         # Create a temporary key column for cross joining within each group
         filtered_df['key'] = 1
-        merged_parent_child_df = pd.merge(filtered_df, filtered_df, on=['HeadEntityID', 'key'], suffixes=('_parent', '_child'))
-
+        merged_parent_child_df = pd.merge(filtered_df, filtered_df, on=['HeadEntityID', 'key'],
+                                          suffixes=('_parent', '_child'))
+        #print(merged_parent_child_df.iloc[3])
         # Drop the temporary 'key' column as it's no longer needed after merging
         merged_parent_child_df.drop('key', axis=1, inplace=True)
         filtered_df.drop('key', axis=1, inplace=True)
-        print(merged_parent_child_df.iloc[8])
-
-        filtered_parent_child_df = self.filter_parent_child_pairs_logically(merged_parent_child_df)
+        #print(merged_parent_child_df.iloc[8])
+        filtered_parent_child_df = self.filter_parent_child_pairs_logically_for_head(merged_parent_child_df)
+        filtered_parent_child_singles = self.filter_parent_child_pairs_logically_for_head_exclusions(
+            merged_parent_child_df)
         grouped_df = filtered_parent_child_df.groupby("TailEntityID_parent")
-        def build_context(group):
+
+        def build_head_context(group):
             concatenated_result = ', '.join(group['RelationName_child'] + ' (' + group['EntityName_Tail_child'] + ')')
             # Concatenate 'RelationName' and 'EntityName_Tail' with conditions
-            result_with_wrapper = "<context>" + concatenated_result[:context_text_length_max] + "</context>" if concatenated_result else ''
-            return pd.DataFrame({'HeadEntityID': group["HeadEntityID"].iloc[0], 'Context': [result_with_wrapper]})  # group.name assumes grouping by HeadEntityID
-        context_with_ids_df = grouped_df.apply(build_context).reset_index(drop=True)
+            result_with_wrapper = "<context>" + concatenated_result[
+                                                :context_text_length_max] + "</context>" if concatenated_result else ''
+            return pd.DataFrame({'HeadEntityID': group["HeadEntityID"].iloc[0],
+                                 'Context': [result_with_wrapper]})  # group.name assumes grouping by HeadEntityID
 
+        context_with_ids_df = grouped_df.apply(build_head_context).reset_index(drop=True)
         # Rename the 'Context' column to 'HeadContext' for use in the first merge
         context_with_head_ids_df = context_with_ids_df.rename(columns={'Context': 'HeadContext'})
-
         # Perform the first merge
         filtered_df_with_head_context = filtered_df.merge(context_with_head_ids_df, on="HeadEntityID", how="left")
 
-        # Rename the 'Context' column to 'TailContext' for use in the second merge
-        context_with_tail_ids_df = context_with_ids_df.rename(columns={'Context': 'TailContext', "HeadEntityID": "HeadEntityID_context"})
-
         # Perform the second merge
-        filtered_df_with_head_and_tail_context = filtered_df_with_head_context.merge(context_with_tail_ids_df, left_on="TailEntityID", right_on="HeadEntityID_context", how="left")
+        filtered_parent_child_tail_df = self.filter_parent_child_pairs_logically_for_tail(merged_parent_child_df)
+        grouped_tail_df = filtered_parent_child_tail_df.groupby("TailEntityID_parent")
+        context_with_ids_tail_df = grouped_tail_df.apply(build_head_context).reset_index(drop=True)
+        # For second merge:
+        context_with_with_ids_for_tail_df = context_with_ids_tail_df.rename(
+            columns={'Context': 'TailContext', "HeadEntityID": "HeadEntityID_context"})
+        filtered_df_with_head_and_tail_context = filtered_df_with_head_context.merge(context_with_with_ids_for_tail_df,
+                                                                                     left_on="TailEntityID",
+                                                                                     right_on="HeadEntityID_context",
+                                                                                     how="left")
         filtered_df_with_head_and_tail_context.drop('HeadEntityID_context', axis=1, inplace=True)
         filtered_df_with_head_and_tail_context.fillna('', inplace=True)
-
         import numpy as np
-
         # Vectorized function to check substring presence
         def check_substring(company_name, context):
             # Convert all elements to string ensuring no non-string types cause issues
             str_context = np.array(list(map(str, context)))
             str_company_name = np.array(list(map(str, company_name)))
-            result = np.char.find(str_context,str_company_name)
+            result = np.char.find(str_context, str_company_name)
             return result == -1  # Returns True where substring is not found
 
         # Create mask for 'EntityName_Tail' in 'HeadContext'
-        condition1 = check_substring(filtered_df_with_head_and_tail_context['EntityName_Tail'], filtered_df_with_head_and_tail_context['HeadContext'])
-
+        condition1 = check_substring(filtered_df_with_head_and_tail_context['EntityName_Tail'],
+                                     filtered_df_with_head_and_tail_context['HeadContext'])
         # Create mask for 'EntityName_Head' in 'TailContext'
-        condition2 = check_substring(filtered_df_with_head_and_tail_context['EntityName_Head'], filtered_df_with_head_and_tail_context['TailContext'])
-
+        condition2 = check_substring(filtered_df_with_head_and_tail_context['EntityName_Head'],
+                                     filtered_df_with_head_and_tail_context['TailContext'])
         combined_conditions = condition1 & condition2
         # Apply the masks using negation to filter out those rows
         filtered_df_with_head_and_tail_context_filtered = filtered_df_with_head_and_tail_context[combined_conditions]
         return filtered_df_with_head_and_tail_context_filtered
 
-    def filter_parent_child_pairs_logically(self, merged_parent_child_df):
+    def filter_parent_child_pairs_logically_for_head(self, merged_parent_child_df):
         # Now, we apply the filter criteria. We will roll up the child tails when neither the parent head nor parent tail
         # appears in it so we don't leak information from source to target
 
-        #condition1 = merged_parent_child_df["TailEntityID_parent"] == merged_parent_child_df["TailEntityID_child"]
+        condition1 = merged_parent_child_df["TailEntityID_parent"] == merged_parent_child_df["TailEntityID_child"]
+        # exclude cases where:
+        #   child tail's name exists in parent head's or parent tail's names or descriptions
+        #   parent head's name exists in child tail's name or descriptions
+        #   parent tail's name exists in child tail's name or descriptions
+        condition2 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Tail_child'].lower() in row['EntityName_Head_parent'].lower(), axis=1
+        )
+        condition3 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Tail_child'].lower() in row['EntityDescription_Head_parent'].lower(), axis=1
+        )
+        condition4 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Tail_child'].lower() in row['EntityName_Tail_parent'].lower(), axis=1
+        )
+        condition5 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Tail_child'].lower() in row['EntityDescription_Tail_parent'].lower(), axis=1
+        )
+        condition6 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Head_parent'].lower() in row['EntityName_Tail_child'].lower(), axis=1
+        )
+        condition7 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Head_parent'].lower() in row['EntityDescription_Tail_child'].lower(), axis=1
+        )
+        condition8 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Tail_parent'].lower() in row['EntityName_Tail_child'].lower(), axis=1
+        )
+        condition9 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Tail_parent'].lower() in row['EntityDescription_Tail_child'].lower(), axis=1
+        )
+        filter_condition = condition1 | condition2 | condition3 | condition4 | condition5 | condition6 | condition7 | condition8 | condition9
+        # Apply the filter with a negation to keep entries that do not meet any of the conditions
+        filtered_merged_parent_child_df = merged_parent_child_df[~filter_condition]
+
+        return filtered_merged_parent_child_df.reset_index(drop=True)
+
+    def filter_parent_child_pairs_logically_for_head_exclusions(self, merged_parent_child_df):
+        # Now, we apply the filter criteria. We will roll up the child tails when neither the parent head nor parent tail
+        # appears in it so we don't leak information from source to target
+
+        condition1 = merged_parent_child_df["TailEntityID_parent"] == merged_parent_child_df["TailEntityID_child"]
+        # exclude cases where:
+        #   child tail's name exists in parent head's or parent tail's names or descriptions
+        #   parent head's name exists in child tail's name or descriptions
+        #   parent tail's name exists in child tail's name or descriptions
+        condition4 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Tail_child'].lower() in row['EntityName_Tail_parent'].lower(), axis=1
+        )
+        condition8 = merged_parent_child_df.apply(
+            lambda row: row['EntityName_Tail_parent'].lower() in row['EntityName_Tail_child'].lower(), axis=1
+        )
+        filter_condition = condition1 | condition4 | condition8
+        # Apply the filter with a negation to keep entries that meet any of the conditions
+        filtered_merged_parent_child_df = merged_parent_child_df[filter_condition]
+
+        return filtered_merged_parent_child_df.reset_index(drop=True)
+
+    def filter_parent_child_pairs_logically_for_tail(self, merged_parent_child_df):
+        # Now, we apply the filter criteria. We will roll up the child tails when neither the parent head nor parent tail
+        # appears in it so we don't leak information from source to target
+
 
         # exclude cases where:
         #   child tail's name exists in parent head's or parent tail's names or descriptions
@@ -373,9 +444,7 @@ HeadEntityID\tRelationID\tTailEntityID
         condition3 = merged_parent_child_df.apply(
             lambda row: row['EntityName_Tail_child'].lower() in row['EntityDescription_Head_parent'].lower(), axis=1
         )
-        # condition4 = merged_parent_child_df.apply(
-        #     lambda row: row['EntityName_Tail_child'].lower() in row['EntityName_Tail_parent'].lower(), axis=1
-        # )
+
         condition5 = merged_parent_child_df.apply(
             lambda row: row['EntityName_Tail_child'].lower() in row['EntityDescription_Tail_parent'].lower(), axis=1
         )
@@ -385,13 +454,11 @@ HeadEntityID\tRelationID\tTailEntityID
         condition7 = merged_parent_child_df.apply(
             lambda row: row['EntityName_Head_parent'].lower() in row['EntityDescription_Tail_child'].lower(), axis=1
         )
-        # condition8 = merged_parent_child_df.apply(
-        #     lambda row: row['EntityName_Tail_parent'].lower() in row['EntityName_Tail_child'].lower(), axis=1
-        # )
+
         condition9 = merged_parent_child_df.apply(
             lambda row: row['EntityName_Tail_parent'].lower() in row['EntityDescription_Tail_child'].lower(), axis=1
         )
-        filter_condition =  condition2 | condition3 | condition5 | condition6 | condition7 | condition9
+        filter_condition = condition2 | condition3 | condition5 | condition6 | condition7 | condition9
         # Apply the filter with a negation to keep entries that do not meet any of the conditions
         filtered_merged_parent_child_df = merged_parent_child_df[~filter_condition]
 
@@ -556,9 +623,57 @@ HeadEntityID\tRelationID\tTailEntityID
 
         # Creating the DataFrame
         df = pd.DataFrame(data)
-        filtered_df = self.filter_parent_child_pairs_logically(df)
+        filtered_df = self.filter_parent_child_pairs_logically_for_head(df)
         assert len(filtered_df) > 0, "DataFrame is empty"
 
+    def test_filter_child_pairs_logically_handles_case2(self):
+
+        data = {
+            'HeadEntityID': [3],
+            'QID_Head_parent': [103],
+            'EntityName_Head_parent': ['Company C'],
+            'EntityDescription_Head_parent': ['Retailer'],
+            'RelationID_parent': [3],
+            'RelationName_parent': ['competes with'],
+            'TailEntityID_parent': [6],
+            'QID_Tail_parent': [106],
+            'EntityName_Tail_parent': ['Company F'],
+            'EntityDescription_Tail_parent': ['Tech firm, the parent of Company A'],
+            'QID_Head_child': [103],
+            'EntityName_Head_child': ['Company C'],
+            'EntityDescription_Head_child': ['Retailer'],
+            'RelationID_child': [3],
+            'RelationName_child': ['competes with'],
+            'TailEntityID_child': [6],
+            'QID_Tail_child': [106],
+            'EntityName_Tail_child': ['Company F'],
+            'EntityDescription_Tail_child': ['Tech firm, the parent of Company A']
+        }
+
+        # Creating the DataFrame
+        df = pd.DataFrame(data)
+        filtered_df = self.filter_parent_child_pairs_logically_for_tail(df)
+        assert len(filtered_df) > 0, "DataFrame is empty"
+
+    def test_filter_child_pairs_logically_handles_case2_e2e(self):
+
+        data = {
+            'HeadEntityID': [3],
+            'QID_Head': [103],
+            'EntityName_Head': ['Company C'],
+            'EntityDescription_Head': ['Retailer'],
+            'RelationID': [3],
+            'RelationName': ['competes with'],
+            'TailEntityID': [6],
+            'QID_Tail': [106],
+            'EntityName_Tail': ['Company F'],
+            'EntityDescription_Tail': ['Tech firm, the parent of Company A'],
+        }
+
+        # Creating the DataFrame
+        df = pd.DataFrame(data)
+        result = self.filter_extract_and_aggregate(df)
+        assert len(result) > 0, "DataFrame is empty"
     def test_fake_wikidata_pipeline_data_are_correct(self):
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -586,30 +701,35 @@ HeadEntityID\tRelationID\tTailEntityID
         assert prepared_df["head_context"].iloc[1] == "" # B has C and F in description, so it has no available context
         assert prepared_df["tail_context"].iloc[1] == ""
 
-        assert prepared_df["head"].iloc[2] == "Company C"
-        assert prepared_df["relation"].iloc[2] == "competes with"
-        assert prepared_df["tail"].iloc[2] == "Company F"
-        assert prepared_df["head_context"].iloc[2] == "<context>partners with (Company E), competes with (Company D)</context>"
-        assert prepared_df["tail_context"].iloc[2] == ""
+        assert prepared_df["head"].iloc[2] == "Company A"
+        assert prepared_df["relation"].iloc[2] == "merged with"
+        assert prepared_df["tail"].iloc[2] == "Company D"
+        assert prepared_df["head_context"].iloc[2] == "" # F has A in description, so it's omitted
+        assert prepared_df["tail_context"].iloc[2] == "" # F has A in description, so it's omitted
 
-        assert prepared_df["head"].iloc[3] == "Company A"
-        assert prepared_df["relation"].iloc[3] == "merged with"
-        assert prepared_df["tail"].iloc[3] == "Company D"
-        assert prepared_df["head_context"].iloc[3] == "" # F has A in description, so it's omitted
-        assert prepared_df["tail_context"].iloc[3] == "" # F has A in description, so it's omitted
+        assert prepared_df["head"].iloc[3] == "Company D"
+        assert prepared_df["relation"].iloc[3] == "acquired by"
+        assert prepared_df["tail"].iloc[3] == "Company F"
+        assert prepared_df["head_context"].iloc[3] == ""
+        assert prepared_df["tail_context"].iloc[3] == "<context>sold products to (Company C)</context>" # B omited since it has F in description. A omitted since it's in description of F.
 
-        assert prepared_df["head"].iloc[4] == "Company D"
-        assert prepared_df["relation"].iloc[4] == "acquired by"
-        assert prepared_df["tail"].iloc[4] == "Company F"
-        assert prepared_df["head_context"].iloc[4] == ""
-        assert prepared_df["tail_context"].iloc[4] == "<context>sold products to (Company C)</context>" # B omited since it has F in description. A omitted since it's in description of F.
-
+        assert prepared_df["head"].iloc[4] == "Company C"
+        assert prepared_df["relation"].iloc[4] == "partners with"
+        assert prepared_df["tail"].iloc[4] == "Company E"
+        assert prepared_df["head_context"].iloc[4] == "<context>competes with (Company F), competes with (Company D)</context>" # E omitted since E is in tail. B omitted since C is in its description
+        assert prepared_df["tail_context"].iloc[4] == "" # E has no directed relations to others
 
         assert prepared_df["head"].iloc[5] == "Company C"
-        assert prepared_df["relation"].iloc[5] == "partners with"
-        assert prepared_df["tail"].iloc[5] == "Company E"
-        assert prepared_df["head_context"].iloc[5] == "<context>competes with (Company F), competes with (Company D)</context>" # E omitted since E is in tail. B omitted since C is in its description
-        assert prepared_df["tail_context"].iloc[5] == ""
+        assert prepared_df["relation"].iloc[5] == "competes with"
+        assert prepared_df["tail"].iloc[5] == "Company F"
+        assert prepared_df["head_context"].iloc[5] == "<context>partners with (Company E), competes with (Company D)</context>"
+        assert prepared_df["tail_context"].iloc[5] == "" # B omitted since its description contains C. A omitted (in description of F). C omitted since it's the head.
+
+        assert prepared_df["head"].iloc[8] == "Company C"
+        assert prepared_df["relation"].iloc[8] == "competes with"
+        assert prepared_df["tail"].iloc[8] == "Company D"
+        assert prepared_df["head_context"].iloc[8] == "<context>partners with (Company E), competes with (Company D)"
+        assert prepared_df["tail_context"].iloc[8] == "<context>acquired by (Company F)"
 
         assert prepared_df["head"].iloc[6] == "Company F"
         assert prepared_df["head_description"].iloc[6] == "Tech firm, the parent of Company A"
@@ -648,3 +768,130 @@ HeadEntityID\tRelationID\tTailEntityID
         original_shape = [512]
         serialized_tensor = torch.tensor(written_df.iloc[0]['source_tokenized'])
         #print(tensor_restored)
+
+    def test_graph_building(self):
+
+        relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.get_fake_wikidata()
+        #relation_df, entity_description_df, entity_name_df, triple_id_df = self.trim_statistically(relation_df, entity_description_df, entity_name_df, triple_id_df)
+        triple_df = self.build_triples_with_descriptions(entity_description_df, entity_id_df, entity_name_df, relation_df,
+                                                         triple_id_df)
+        prefiltered_df = self.filter_triples_logically_before_join(triple_df)
+
+        graph = self.build_networkx_graph(prefiltered_df)
+
+        filtered_df = self.filter_adjacent_nodes(graph)
+        print(filtered_df.head())
+
+
+    def build_networkx_graph(self, dataframe):
+        # Create the graph
+        G = nx.from_pandas_edgelist(
+            dataframe,
+            source='HeadEntityID',
+            target='TailEntityID',
+            edge_attr='RelationName',
+            create_using=nx.DiGraph()
+        )
+
+        # Add node attributes for head entities
+        for _, row in dataframe.iterrows():
+            G.nodes[row['HeadEntityID']].update({
+                'EntityName': row['EntityName_Head'],
+                'EntityDescription': row['EntityDescription_Head']
+            })
+
+            # Add node attributes for tail entities
+            G.nodes[row['TailEntityID']].update({
+                'EntityName': row['EntityName_Tail'],
+                'EntityDescription': row['EntityDescription_Tail']
+            })
+        return G
+
+    def filter_adjacent_nodes(self, G):
+        results = []
+
+        # Iterate over each pair of nodes
+        for H, T in G.edges():
+            head_data = G.nodes[H]
+            tail_data = G.nodes[T]
+
+            # Find adjacent nodes for H
+            head_context = self.build_node_context(G, H, T)
+
+            # Find adjacent nodes for T
+            tail_context = self.build_node_context(G, T, H)
+
+            # Collect the relationship type
+            relation = G.get_edge_data(H, T)['RelationName'] if G.has_edge(H, T) else ''
+
+            # Predict head objective:
+            results.append({
+                'source': f"<cls>predict head: Head: <head>. Relation: {relation}. Tail: {tail_data['EntityName']}<tail_description>{tail_data['EntityDescription']}</tail_description>",
+                "target": f"<head>{head_data['EntityName']}<end>",
+                'head': head_data['EntityName'],
+                'head_description': head_data['EntityDescription'],
+                'head_context' : head_context,
+                'relation': relation,
+                'tail': tail_data['EntityName'],
+                'tail_description': tail_data['EntityDescription'],
+                'tail_context': tail_context,
+                "objective": "predict_head"
+            })
+
+            # Predict tail objective:
+            results.append({
+                'source': f"<cls>predict tail: Head: {head_data['EntityName']}<head_description>{head_data['EntityDescription']}</head_description>Relation: {relation}. Tail: <tail>",
+                "target": f"<tail>{tail_data['EntityName']}<end>",
+                'head': head_data['EntityName'],
+                'head_description': head_data['EntityDescription'],
+                'head_context' : head_context,
+                'relation': relation,
+                'tail': tail_data['EntityName'],
+                'tail_description': tail_data['EntityDescription'],
+                'tail_context': tail_context,
+                "objective": "predict_tail"
+            })
+
+            # Predict relation objective:
+
+            results.append({
+                'source': f"<cls>predict relation: Head: {head_data['EntityName']}<head_description>{head_data['EntityName']}</head_description>Relation: <relation>. Tail: {tail_data['EntityName']}<tail_description>{tail_data['EntityDescription']}</tail_description>",
+                "target": f"<relation>{relation}<end>",
+                'head': head_data['EntityName'],
+                'head_description': head_data['EntityDescription'],
+                'head_context' : head_context,
+                'relation': relation,
+                'tail': tail_data['EntityName'],
+                'tail_description': tail_data['EntityDescription'],
+                'tail_context': tail_context,
+                "objective": "predict_relation"
+            })
+
+        return pd.DataFrame(results).drop_duplicates().reset_index(drop=True)
+
+    def build_node_context(self, G, source_node_id, target_node_id):
+        head_data = G.nodes[source_node_id]
+        tail_data = G.nodes[target_node_id]
+        head_name_and_description = f"{head_data['EntityName']} {head_data['EntityDescription']}"
+        tail_name_and_description = f"{tail_data['EntityName']} {tail_data['EntityDescription']}"
+        adjacents = []
+        for adjacent_node_id in G.successors(source_node_id):
+            adjacent_node = G.nodes[adjacent_node_id]
+            adjacent_name_and_description = f"{adjacent_node['EntityName']} {adjacent_node['EntityDescription']}"
+
+            adjacent_name_in_head = adjacent_node["EntityName"] in head_name_and_description
+            adjacent_name_in_tail = adjacent_node["EntityName"] in tail_name_and_description
+            head_name_in_adjacent = head_data['EntityName'] in adjacent_name_and_description
+            tail_name_in_adjacent = tail_data['EntityName'] in adjacent_name_and_description
+
+            any_true = any([adjacent_name_in_head, adjacent_name_in_tail, head_name_in_adjacent, tail_name_in_adjacent])
+
+            if not any_true:
+                relation = G.get_edge_data(source_node_id, adjacent_node_id)['RelationName'] if G.has_edge(source_node_id, adjacent_node_id) else ''
+                # Add relation with name as context
+                successor_context = f"{relation} ({adjacent_node['EntityName']})"
+                adjacents.append(successor_context)
+        # join adjacents into csv
+        adjacents_text = ", ".join(adjacents)
+        head_context = "<context>" + adjacents_text + "</context>" if len(adjacents_text) > 0 else ''
+        return head_context
