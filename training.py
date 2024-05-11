@@ -13,6 +13,9 @@ from langchain.chat_models import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda, Runnable
 from langchain.prompts import PromptTemplate
+from torchmetrics.retrieval import RetrievalMRR
+from torchmetrics.retrieval import RetrievalNormalizedDCG
+from torchmetrics.retrieval import RetrievalHitRate
 import faiss
 import os
 import random
@@ -29,29 +32,38 @@ torch.manual_seed(seed)
 # If you are using CUDA (GPU), also set this for reproducibility
 torch.cuda.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)  # For multi-GPU setups
-batch_size = 12
+batch_size = 2
 
 # Used at eval
 import sentencepiece
 print(sentencepiece.__version__)
 
 import pandas as pd
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-0125")
 
 # Run from terminal: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 
 filename = "knowledge_tuples"
-suffix = "T5_knowledge_graph_pretrain_v3_predict_tail_no_mlm"
-dataset_prefix = "DataModuleWith_Tail_NoMLM"
+suffix = "T5_knowledge_graph_pretrain_v3_predict_all_torchmetrics"
+dataset_prefix = "DataModuleWith_Tail_OneSep"
 # Used at eval
 save_path = '/teamspace/studios/this_studio/data/'
 
+# These were used for training this file:
 special_tokens = [
-    "<cls>", "<head>", "<head_description>", "</head_description>", "<mask>","<relation>", "<tail>", "<tail_description>","</tail_description>","<relation>", "<end>", "<context>", "</context>"
+    "<cls>", "<mask>", "<end>", "<sep>", "<head>", "<tail>", "<relation>"
 ]
 # for i in range(1, 151):
 #     special_tokens.append(f"<x{i}>") # These are used for MLM
 
-# Used at eval
+# special_tokens = [
+#     "<cls>", "<head>", "<head_description>", "</head_description>", "<mask>","<relation>", "<tail>", "<tail_description>","</tail_description>","<relation>", "<end>"
+# ]
+# for i in range(1, 151):
+#     special_tokens.append(f"<x{i}>") # These are used for MLM
+df_size_limit = 10
 
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
@@ -60,7 +72,7 @@ from transformers import T5Config
 
 torch.set_float32_matmul_precision("medium")
 
-vector_length = 1024
+vector_length = 512
 
 from pydantic import BaseModel
 from typing import Optional, List
@@ -75,8 +87,8 @@ class Part(BaseModel):
 class KBDataset(Dataset):
     def __init__(self, tokenizer, df, num_entities, max_length=vector_length):
         self.tokenizer = tokenizer
-        self.source_rows = df['source']
-        self.target_rows = df['target']
+        self.source_rows = df['Source']
+        self.target_rows = df['Target']
         self.max_length = max_length
         self.num_entities = num_entities
         self.df = df
@@ -85,8 +97,8 @@ class KBDataset(Dataset):
         return len(self.source_rows)
 
     def __getitem__(self, idx):
-        source = self.df['source'][idx]
-        target = self.df['target'][idx]
+        source = self.df['Source'][idx]
+        target = self.df['Target'][idx]
         relation = self.df['relation'][idx]
         tail = self.df['tail'][idx]
         tail_description = self.df['tail_description'][idx]
@@ -113,7 +125,7 @@ class KBDataset(Dataset):
                 "tail_description": tail_description,
                 "objective": objective}
 
-class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
+class DataModuleWith_Tail_OneSep(pl.LightningDataModule):
     def __init__(self, tokenizer, batch_size=2, max_length=vector_length, data_file=save_path + filename + '.parquet'):
         super().__init__()
         self.tokenizer = tokenizer
@@ -365,8 +377,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
         return source_text, target_text
 
     def prepare_dataset(self, df):
-        mem_head = df.apply(lambda x: pd.Series({"source": f"<cls>predict head: Head: <head>. Relation: {x['relation']}. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
-                                                     "target": f"<head>{x['head']}<end>",
+        mem_head = df.apply(lambda x: pd.Series({"Source": f"<cls>predict head: Head: <head><sep>Relation: {x['relation']}<sep>Tail: {x['tail']}<sep>{x['tail_description']}<sep>",
+                                                     "Target": f"<head>{x['head']}<end>",
                                                      "relation": x['relation'],
                                                      "tail": x['tail'],
                                                      "tail_description": x['tail_description'],
@@ -374,8 +386,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
                                                      "head_description": x['head_description'],
                                                      "objective": "predict_head"
                                                      }), axis=1)
-        mem_tail = df.apply(lambda x: pd.Series({"source": f"<cls>predict tail: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: {x['relation']}. Tail: <tail>",
-                                                     "target": f"<tail>{x['tail']}<end>",
+        mem_tail = df.apply(lambda x: pd.Series({"Source": f"<cls>predict tail: Head: {x['head']}<sep>{x['head_description']}<sep>Relation: {x['relation']}<sep>Tail: <tail><sep>",
+                                                     "Target": f"<tail>{x['tail']}<end>",
                                                      "relation": x['relation'],
                                                      "tail": x['tail'],
                                                      "tail_description": x['tail_description'],
@@ -384,45 +396,8 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
                                                      "objective": "predict_tail"
                                                      }), axis=1)
 
-        # mem_tail_plain = df.apply(lambda x: pd.Series({"source": f"<cls>predict tail: {x['head']}, {x['head_description']}. {x['relation']}",
-        #                                              "target": f"{x['tail']}",
-        #                                              "relation": x['relation'],
-        #                                              "tail": x['tail'],
-        #                                              "tail_description": x['tail_description'],
-        #                                              "head": x['head'],
-        #                                              "head_description": x['head_description'],
-        #                                              "objective": "predict_tail"
-        #                                              }), axis=1).head(100)
-
-        def randomly_delete_words(text):
-            words = text.split()
-            n_to_delete = len(words) // 10
-            words_to_delete = np.random.choice(words, n_to_delete, replace=False)
-            return ' '.join(word for word in words if word not in words_to_delete)
-        
-        # mem_tail_plain_deletes = df.apply(lambda x: pd.Series({"source": f"<cls>predict tail: {x['head']}, {x['head_description']}. {x['relation']}",
-        #                                              "target": f"{x['tail']}",
-        #                                              "relation": x['relation'],
-        #                                              "tail": x['tail'],
-        #                                              "tail_description": x['tail_description'],
-        #                                              "head": x['head'],
-        #                                              "head_description": x['head_description'],
-        #                                              "objective": "predict_tail"
-        #                                              }), axis=1)
-        
-        # mem_tail_plain_deletes['source'] = mem_tail_plain_deletes['source'].apply(randomly_delete_words)
-
-        # loop = asyncio.new_event_loop()
-        # asyncio.set_event_loop(loop)
-        # try:
-        #     # Run the asynchronous function using the event loop
-        #     mem_tail_with_questions = loop.run_until_complete(self.generate_questions(model, mem_tail))
-        # finally:
-        #     # Close the loop to clean up
-        #     loop.close()
-
-        mem_relation = df.apply(lambda x: pd.Series({"source": f"<cls>predict relation: Head: {x['head']}<head_description>{x['head_description']}</head_description>Relation: <relation>. Tail: {x['tail']}<tail_description>{x['tail_description']}</tail_description>",
-                                                     "target": f"<relation>{x['relation']}<end>",
+        mem_relation = df.apply(lambda x: pd.Series({"Source": f"<cls>predict relation: Head: {x['head']}<sep>{x['head_description']}<sep>Relation: <relation><sep>Tail: {x['tail']}<sep>{x['tail_description']}<sep>",
+                                                     "Target": f"<relation>{x['relation']}<end>",
                                                      "relation": x['relation'],
                                                      "tail": x['tail'],
                                                      "tail_description": x['tail_description'],
@@ -430,80 +405,13 @@ class DataModuleWith_Tail_NoMLM(pl.LightningDataModule):
                                                      "head_description": x['head_description'],
                                                      "objective": "predict_relation"
                                                      }), axis=1)
-        
-        def process_row15(x):
-            source, target = self.generate_word_masks(x['head'], x['head_description'], x['relation'], x['tail'], x['tail_description'], 15)
-            return pd.Series({"source": source, 
-                                "target": target,
-                                "relation": x['relation'],
-                                "tail": x['tail'],
-                                "tail_description": x['tail_description'],
-                                "head": x['head'],
-                                "head_description": x['head_description'],
-                                "objective": "mlm"})
-        
-
-        
-        #mlm_df15 = df.apply(process_row15, axis=1)
 
         # Combine both transformations and remove duplicates
         new_df = pd.concat([mem_head, mem_relation, mem_tail]).drop_duplicates().reset_index(drop=True)
         return new_df
 
-    def generate_question_prompt(self) -> PromptTemplate:
-        prompt = (
-            "You're a text parser. Generate a question when given a source. For example, if your SOURCE is like the following EXAMPLE SOURCE, create a question like EXAMPLE QUESTION."
-            "EXAMPLE SOURCE:"
-            "Head: iPhone 15. Relation: requires"
-            "EXAMPLE QUESTION:"
-            "The iPhone 15 requires what?"
-            "ACTUAL SOURCE:"
-            "Head: {Head}. Relation: {Relation}."
-            "ACTUAL QUESTION:"
-            )
-        return PromptTemplate.from_template(prompt)
-
-    def build_question_creation_chain(self, model: ChatOpenAI) -> Runnable:
-        chain = (
-            {
-                "Head": itemgetter("head"),
-                "Relation": itemgetter("relation")
-            }
-            | self.generate_question_prompt()
-            | model
-            | StrOutputParser()
-            | RunnableLambda(lambda x: "<cls>" + x + " Tail: <tail>") #RunnableLambda(lambda x: "<cls>Predict tail: Head and relation: " + x + " Tail: <tail>")
-        )
-        return chain
-
-    async def async_invoke(self, question_generation_chain, head, relation):
-        # Simulate an async API call
-        # This function should be truly asynchronous and handle API calls or async operations
-        return await question_generation_chain.ainvoke({"head": head, "relation": relation})
-    
-    async def generate_questions(self, model: ChatOpenAI, df):
-        question_generation_chain = self.build_question_creation_chain(model)
-        # Use asyncio to gather results from asynchronous operations
-        # limit = 3
-        # df_topk = df.head(limit).reset_index(drop=True)
-        tasks = []
-        for index, row in  tqdm(df.iterrows(), total=len(df), desc="Processing row in generate_questions"):
-            task = asyncio.create_task(self.async_invoke(question_generation_chain, row['head'], row['relation']))
-            tasks.append(task)
-
-        # Await all tasks and get the results
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for idx, result in enumerate(results):
-            if isinstance(result, Exception):
-                # Handle the exception (log it, retry, or other error handling)
-                print("Error encountered:", result)
-                results[idx] = np.nan # Ensure the value isn't interpreted as a question
-
-
-        # Assign results back to the DataFrame
-        df['test_question'] = results
-
-        return df
+# from sentence_transformers import SentenceTransformer
+# embedding_model_test = SentenceTransformer('sentence-transformers/all-MiniLM-L12-v2')
 
 class KBModel(pl.LightningModule):
     def __init__(self, data_module, special_tokens, learning_rate=0.001):
@@ -524,8 +432,6 @@ class KBModel(pl.LightningModule):
         self.faiss_index.hnsw.efConstruction = self.efConstruction
 
         self.ranks_dicts = []
-
-        self.vector_limit = 1000
 
         self.num_predictions = 60 # This is something we may want to vary by config
         self.max_length = 512
@@ -596,143 +502,433 @@ class KBModel(pl.LightningModule):
     #     #return pooled_embeddings.cpu().numpy()  # # Pooling over the sequence dimension. Then, convert tensor to numpy array
     #     return embeddings
 
+    def generate_question_prompt(self) -> PromptTemplate:
+        prompt = (
+            "You're a text parser. Generate a question when given a source. For example, if your SOURCE is like the following EXAMPLE SOURCE, create a question like EXAMPLE QUESTION."
+            "EXAMPLE SOURCE:"
+            "Head: iPhone 15. Relation: requires"
+            "EXAMPLE QUESTION:"
+            "The iPhone 15 requires what?"
+            "ACTUAL SOURCE:"
+            "Head: {Head}. Relation: {Relation}."
+            "ACTUAL QUESTION:"
+            )
+        return PromptTemplate.from_template(prompt)
+
+    def build_question_creation_chain(self, model: ChatOpenAI) -> Runnable:
+        chain = (
+            {
+                "Head": itemgetter("head"),
+                "Relation": itemgetter("relation")
+            }
+            | self.generate_question_prompt()
+            | model
+            | StrOutputParser()
+            | RunnableLambda(lambda x: "<cls>predict tail:" + x + "<sep>Tail: <tail><sep>") #RunnableLambda(lambda x: "<cls>Predict tail: Head and relation: " + x + " Tail: <tail>")
+        )
+        return chain
+
+    async def async_invoke(self, question_generation_chain, head, relation):
+        # Simulate an async API call
+        # This function should be truly asynchronous and handle API calls or async operations
+        return await question_generation_chain.ainvoke({"head": head, "relation": relation})
+    
+    async def generate_topk_questions(self, model: ChatOpenAI, df, limit):
+        question_generation_chain = self.build_question_creation_chain(model)
+        # Use asyncio to gather results from asynchronous operations
+        df_topk = df.head(limit).reset_index(drop=True)
+        tasks = []
+        for index, row in tqdm(df_topk.iterrows(), total=len(df_topk), desc="Processing row in generate_topk_questions"):
+            task = asyncio.create_task(self.async_invoke(question_generation_chain, row['head'], row['relation']))
+            tasks.append(task)
+
+        # Await all tasks and get the results
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Handle the exception (log it, retry, or other error handling)
+                print("Error encountered:", result)
+                results[idx] = np.nan # Ensure the value isn't interpreted as a question
+
+        # Assign results back to the DataFrame
+        df['test_question'] = results
+
+        return df
+
     def prepare_query_vector(self, query_text):
-        tokenized_query = self.tokenizer(query_text, return_tensors='pt', padding=True, truncation=True, max_length=512).to('cuda')
+        #query_text = ['<cls>predict tail: Head: Newphoria<sep>An online retailer offering the iPhone 15 on a promotional deal<sep>Relation: provides promotion<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Get it on us<sep>A promotional offer where customers can get the iPhone 15 for free<sep>Relation: is available through<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Verizon<sep>Verizon is a telecommunications company that provides wireless services, devices, and support to customers.<sep>Relation: no longer supports<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Verizon<sep>Verizon is a telecommunications company that provides wireless services, devices, and support to customers.<sep>Relation: no longer supports<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Verizon<sep>Verizon is a telecommunications company that provides wireless services, devices, and support to customers.<sep>Relation: no longer supports<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Verizon<sep>Verizon is a telecommunications company that provides wireless services, devices, and support to customers.<sep>Relation: no longer supports<sep>Tail: <tail><sep>', '<cls>predict tail: Head: cellular carrier<sep>A company that provides wireless communication services to customers through the use of mobile devices such as smartphones and tablets.<sep>Relation: operated with<sep>Tail: <tail><sep>']
+        #test_query_text = '<cls>predict tail: Newphoria An online retailer offering the iPhone 15 on a promotional deal provides promotion<sep>Tail: <tail><sep>'
+        #test_query_text = '<cls>predict tail: What needs to be clarified about the smart hospital room?<sep>Tail: <tail><sep>'
+        tokenized_query = self.tokenizer(query_text, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
         input_ids = tokenized_query['input_ids'].to('cuda')
         attention_mask = tokenized_query['attention_mask'].to('cuda')
+
+        # input_batch = {
+        #     'input_ids': input_ids, 
+        #     'attention_mask': attention_mask,
+        #     'do_sample': False,
+        #     'num_beams': 1,
+        #     'eos_token_id': self.tokenizer.eos_token_id,
+        #     'pad_token_id': self.tokenizer.pad_token_id,
+        #     'max_length': self.max_output_length,
+        #     'output_scores': True,
+        #     'return_dict_in_generate': True,
+        #     'output_hidden_states': True,
+        # }
+        # # input_batch = {
+        # #     'input_ids': input_ids, 
+        # #     'attention_mask': attention_mask,
+        # #     'temperature': 1,  # TODO: make this argument?
+        # #     'do_sample': True,
+        # #     'num_return_sequences': self.num_predictions,
+        # #     'num_beams': 1,
+        # #     'eos_token_id': self.tokenizer.eos_token_id,
+        # #     'pad_token_id': self.tokenizer.pad_token_id,
+        # #     'max_length': self.max_output_length,
+        # #     'output_scores': True,
+        # #     'return_dict_in_generate': True,
+        # #     'max_length': 20
+        # # }
+        # # outputs = self.model.generate(**input_batch)
+        # # sequences = outputs.sequences
+        # # predictions: List[str] = self.tokenizer.batch_decode(sequences, skip_special_tokens=True)
+
+        # # tokens_hidden_states = outputs.decoder_hidden_states[-1]
+        # # last_hidden_layer = tokens_hidden_states[-1]
+
+        # # # Compute the mean of the hidden states across the sequence length dimension
+        # # mean_pooled_output = torch.mean(last_hidden_layer, dim=1, keepdim=False).detach().cpu().numpy()
+
+        # outputs = self.model.generate(**input_batch)
+
+        # # tokens_hidden_states = outputs.decoder_hidden_states[-1]
+        # # last_hidden_layer = tokens_hidden_states[-1]
+        # ## Compute the mean of the hidden states across the sequence length dimension
+        # # mean_pooled_output = torch.mean(last_hidden_layer, dim=1, keepdim=False).detach().cpu().numpy()
+
+        # # Extract the last tensors from each tuple
+        # last_tensors = [hidden_state_tuple[-1] for hidden_state_tuple in outputs.decoder_hidden_states]
+
+        # # Stack all the last tensors along a new dimension (layer axis)
+        # stacked_last_tensors = torch.stack(last_tensors, dim=0)
+
+        # # Take the mean across the new first dimension (layers)
+        # mean_pooled_output = torch.mean(stacked_last_tensors, dim=0).detach().cpu().numpy()
+
+        # flattened_output = mean_pooled_output.squeeze(axis=1)
+
+        # input_batch = {
+        #     'input_ids': input_ids, 
+        #     'attention_mask': attention_mask,
+        #     'do_sample': False,
+        #     'num_beams': 1,
+        #     'eos_token_id': self.tokenizer.eos_token_id,
+        #     'pad_token_id': self.tokenizer.pad_token_id,
+        #     'max_length': self.max_output_length,
+        #     'output_scores': True,
+        #     'return_dict_in_generate': True,
+        #     'output_hidden_states': True,
+        # }
+        # outputs = self.model.generate(**input_batch)
+
+        # tokens_hidden_states = outputs.decoder_hidden_states[-1] # Should correspond to last decode step
+        # last_hidden_layer = tokens_hidden_states[-1] # Should correspond to last layer
+
+        # # ## Compute the mean of the hidden states across the sequence length dimension
+        # mean_pooled_output = torch.mean(last_hidden_layer, dim=1, keepdim=False).detach().cpu().numpy()
+        # return mean_pooled_output
+
+        ################
+        # This code was working:
         with torch.no_grad():  # Ensure model is in eval mode and no gradients are computed
             encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
             embeddings = encoder_outputs.last_hidden_state
             pooled_embeddings = torch.mean(embeddings, dim=1)  # Pooling over the sequence dimension
         return pooled_embeddings.cpu().numpy()  # Convert tensor to numpy array
-    
+
+
+        # return mean_pooled_output
+
+        # with torch.no_grad():  # Ensure model is in eval mode and no gradients are computed
+        #     decoder_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        #     first_token_hidden_state = decoder_outputs.decoder_hidden_states[-1][:, 0, :]
+        #     first_token_vector = first_token_hidden_state.detach().cpu().numpy()
+        #     # encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        #     # embeddings = encoder_outputs.last_hidden_state
+        #     # pooled_embeddings = torch.mean(embeddings, dim=1)  # Pooling over the sequence dimension
+        # return first_token_vector #pooled_embeddings.cpu().numpy()  # Convert tensor to numpy array
+
     def write_to_faiss(self, batch_size=20):
-        # Need to clear the index.
-        self.faiss_index = faiss.IndexHNSWFlat(vector_length, self.index_m)
-        self.faiss_index.hnsw.efConstruction = self.efConstruction
-        self.metadata = []
+        with torch.no_grad():
+            # Need to clear the index.
+            self.faiss_index = faiss.IndexHNSWFlat(vector_length, self.index_m)
+            self.faiss_index.hnsw.efConstruction = self.efConstruction
+            self.metadata = []
 
-        # Goal is to get validation questions to beat embeddings from training data
-        # Combine and deduplicate entries from all datasets
-        combined_df = pd.concat([self.train_dataset.df, self.val_dataset.df, self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
-        # Filter to only rows where 'objective' is 'predict_tail'
-        filtered_df = combined_df[combined_df['objective'] == "predict_tail"].reset_index(drop=True)
-        
-        # Calculate the number of batches
-        num_batches = len(filtered_df) // batch_size + (0 if len(filtered_df) % batch_size == 0 else 1)
-
-        # Process each batch
-        for batch_idx in range(num_batches):
-            # Slice the DataFrame to get the batch
-            start_idx = batch_idx * batch_size
-            end_idx = start_idx + batch_size
-            batch_df = filtered_df.iloc[start_idx:end_idx]
+            # Goal is to get validation questions to beat embeddings from training data
+            # Combine and deduplicate entries from all datasets
+            combined_df = pd.concat([self.train_dataset.df, self.val_dataset.df, self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
+            # Filter to only rows where 'objective' is 'predict_tail'
+            #filtered_df = combined_df[combined_df['objective'] == "predict_tail"].reset_index(drop=True)
+            filtered_df = combined_df
             
-            # Prepare batch data
-            sources = batch_df['source'].tolist()
-            tokenized_input = self.tokenizer(sources, return_tensors='pt', padding=True, truncation=True, max_length=512).to('cuda')
-            input_ids = tokenized_input['input_ids'].to('cuda')
-            attention_mask = tokenized_input['attention_mask'].to('cuda')
+            # Calculate the number of batches
+            num_batches = len(filtered_df) // batch_size + (0 if len(filtered_df) % batch_size == 0 else 1)
 
-            # Get encoder outputs
-            encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
-            embeddings = encoder_outputs.last_hidden_state
-            
-            # Pool embeddings over the sequence dimension
-            pooled_embeddings = torch.mean(embeddings, dim=1).cpu().numpy()  # Convert to numpy array for FAISS
-            
-            # Add embeddings to FAISS index in batch
-            self.faiss_index.add(pooled_embeddings)
+            # Process each batch
+            for batch_idx in range(num_batches):
+                # Slice the DataFrame to get the batch
+                start_idx = batch_idx * batch_size
+                end_idx = start_idx + batch_size
+                batch_df = filtered_df.iloc[start_idx:end_idx]
+                
+                # Prepare batch data
+                sources = batch_df['Source'].tolist()
+                tokenized_input = self.tokenizer(sources, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
+                input_ids = tokenized_input['input_ids'].to('cuda')
+                attention_mask = tokenized_input['attention_mask'].to('cuda')
 
-            # Store metadata associated with embeddings
-            metadata_entries = batch_df.apply(lambda row: (row['objective'], row['head'], row['head_description'],
-                                                        row['relation'], row['tail'], row['tail_description']), axis=1).tolist()
-            self.metadata.extend(metadata_entries)
+                # ### Debugging
+                # input_batch2 = {
+                #     'input_ids': input_ids, 
+                #     'attention_mask': attention_mask,
+                #     'temperature': 1,  # TODO: make this argument?
+                #     'do_sample': True,
+                #     'num_return_sequences': self.num_predictions,
+                #     'num_beams': 1,
+                #     'eos_token_id': self.tokenizer.eos_token_id,
+                #     'pad_token_id': self.tokenizer.pad_token_id,
+                #     'max_length': self.max_output_length,
+                #     'output_scores': True,
+                #     'return_dict_in_generate': True,
+                #     'max_length': 20
+                # }
+                # outputs2 = self.model.generate(**input_batch2)
+                # sequences2 = outputs2.sequences
+                # predictions: List[str] = self.tokenizer.batch_decode(sequences2, skip_special_tokens=True)
+                # ### End debugging
 
-        print("FAISS indexing complete and metadata stored.")
+                # input_batch = {
+                #     'input_ids': input_ids, 
+                #     'attention_mask': attention_mask,
+                #     'do_sample': False,
+                #     'num_beams': 1,
+                #     'eos_token_id': self.tokenizer.eos_token_id,
+                #     'pad_token_id': self.tokenizer.pad_token_id,
+                #     'max_length': self.max_output_length,
+                #     'output_scores': True,
+                #     'return_dict_in_generate': True,
+                #     'output_hidden_states': True,
+                # }
+                # outputs = self.model.generate(**input_batch)
 
-    # def write_to_faiss(self, batch_size=20):
-    #     # Need to clear the index.
-    #     self.faiss_index = faiss.IndexHNSWFlat(vector_length, self.index_m)
-    #     self.faiss_index.hnsw.efConstruction = self.efConstruction
-    #     self.metadata = []
+                # tokens_hidden_states = outputs.decoder_hidden_states[-1] # Should correspond to last decode step
+                # last_hidden_layer = tokens_hidden_states[-1] # Should correspond to last layer
 
-    #     # Goal is to get validation questions to beat embeddings from training data
-    #     # Combine and deduplicate entries from all datasets
-    #     combined_df = pd.concat([self.train_dataset.df, self.val_dataset.df]).drop_duplicates().reset_index(drop=True)
-    #     # Filter to only rows where 'objective' is 'predict_tail'
-    #     filtered_df = combined_df[combined_df['objective'] == "predict_tail"].reset_index(drop=True)
-        
-    #     # Calculate the number of batches
-    #     num_batches = len(filtered_df) // batch_size + (0 if len(filtered_df) % batch_size == 0 else 1)
+                # # ## Compute the mean of the hidden states across the sequence length dimension
+                # mean_pooled_output = torch.mean(last_hidden_layer, dim=1, keepdim=False).detach().cpu().numpy()
 
-    #     # Process each batch
-    #     for batch_idx in range(num_batches):
-    #         # Slice the DataFrame to get the batch
-    #         start_idx = batch_idx * batch_size
-    #         end_idx = start_idx + batch_size
-    #         batch_df = filtered_df.iloc[start_idx:end_idx]
-            
-    #         # Prepare batch data
-    #         sources = batch_df['source'].tolist()
-    #         tokenized_input = self.tokenizer(sources, return_tensors='pt', padding=True, truncation=True, max_length=512).to('cuda')
-    #         input_ids = tokenized_input['input_ids'].to('cuda')
-    #         attention_mask = tokenized_input['attention_mask'].to('cuda')
+                # # Extract the last tensors from each tuple
+                # last_tensors = [hidden_state_tuple[-1] for hidden_state_tuple in outputs.decoder_hidden_states]
 
-    #         # Get outputs
-    #         outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
-    #         #outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-    #         last_hidden_state = outputs.last_hidden_state
+                # # Stack all the last tensors along a new dimension (layer axis)
+                # stacked_last_tensors = torch.stack(last_tensors, dim=0)
 
-    #         # Extract the first token from the decoder's outputs (assuming batch_first=True)
-    #         embeddings = last_hidden_state[:, 0, :].cpu().numpy()  # Convert to numpy array for FAISS
+                # # Take the mean across the new first dimension (layers)
+                # mean_pooled_output = torch.mean(stacked_last_tensors, dim=0).detach().cpu().numpy()
 
-    #         #embeddings = encoder_outputs.last_hidden_state
-            
-    #         # Pool embeddings over the sequence dimension
-    #         # embeddings = torch.mean(embeddings, dim=1).cpu().numpy()  # Convert to numpy array for FAISS
-            
-    #         # Add embeddings to FAISS index in batch
-    #         self.faiss_index.add(embeddings)
+                # flattened_output = mean_pooled_output.squeeze(axis=1)
 
-    #         # Store metadata associated with embeddings
-    #         metadata_entries = batch_df.apply(lambda row: (row['objective'], row['head'], row['head_description'],
-    #                                                     row['relation'], row['tail'], row['tail_description']), axis=1).tolist()
-    #         self.metadata.extend(metadata_entries)
+                # Teacher forcing approach:
+                # targets = batch_df['Target'].tolist()
+                # tokenized_target = self.tokenizer(targets, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
+                # target_ids = tokenized_target['input_ids'].to('cuda')
 
-    #     print("FAISS indexing complete and metadata stored.")
+                # # Get encoder outputs
+                # encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                # embeddings = encoder_outputs.last_hidden_state
+                
+                # # Pool embeddings over the sequence dimension
+                # pooled_embeddings = torch.mean(embeddings, dim=1).cpu().numpy()  # Convert to numpy array for FAISS
 
-    # common function for test and val evaluation
-    def compute_vector_search_mrr(self, dataset, ranks_dicts):
-        
-        filtered_df = dataset.df[ (dataset.df['objective'] == 'predict_tail') & (dataset.df['test_question'].notna())].reset_index(drop=True)
+                # Approach involving first decoder token:
+                # decoder_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids, output_hidden_states=True)
+                # first_token_hidden_state = decoder_outputs.decoder_hidden_states[-1][:, 0, :]
+                # first_token_vector = first_token_hidden_state.detach().cpu().numpy()
+                
+                # Add embeddings to FAISS index in batch
+                #sentences = embedding_model_test.encode(sources)
+
+                # Get encoder outputs
+
+                #############
+                # This section was working:
+                encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                embeddings = encoder_outputs.last_hidden_state
+                
+                # Pool embeddings over the sequence dimension
+                mean_pooled_output = torch.mean(embeddings, dim=1).detach().cpu().numpy()  # Convert to numpy array for FAISS
+                #############
+                
+
+                self.faiss_index.add(mean_pooled_output)
+                #self.faiss_index.add(mean_pooled_output)
+
+                # Store metadata associated with embeddings
+                metadata_entries = batch_df.apply(lambda row: (row['objective'], row['head'], row['head_description'],
+                                                            row['relation'], row['tail'], row['tail_description']), axis=1).tolist()
+                # Does apply preserve order?
+                self.metadata.extend(metadata_entries)
+
+            print("FAISS indexing complete and metadata stored.")
+
+    
+    def compute_vector_search_mrr(self, dataset):
+        # Index into vector search
+
+        # Get top items randomly from DF
+        #  filtered_df = dataset.df[ (dataset.df['objective'] == 'predict_tail')].sample(frac=1, random_state=seed).head(df_size_limit).reset_index(drop=True)
+        filtered_df = dataset.df
+        #filtered_df = dataset.df.sample(frac=1, random_state=seed).head(df_size_limit).reset_index(drop=True)
         print(f"ANN df is length: {len(filtered_df)}")
+
+        tail_targets = []
+        tail_results = []
+        tail_indexes = []
+
+        head_targets = []
+        head_results = []
+        head_indexes = []
         
-        self.write_to_faiss()
-        for index, row in filtered_df.iterrows():
-            question = row["test_question"]
-            true_tail = row["tail"]
-        
-            question_vector = self.prepare_query_vector(question)
-        
-            distances, indices = self.faiss_index.search(question_vector.reshape(1, -1), self.vector_limit)  # Reshape query to 2D array for FAISS
-            results = [self.metadata[i][4] for i in indices[0]]  # Item with position==4 is the tail
-        
-            # Determine the rank of the true tail
-            try:
-                rank = next(i for i, result in enumerate(results, start=1) if result == true_tail)
-                # Start = 1, so index position is already adjusted
-            except StopIteration:
-                # If the true tail is not in the results, you can decide how to handle this.
-                # Options: skip, add a large number, or treat as the lowest rank (e.g., 10+1 if top 10 results).
-                 # or 1 / (10 + 1) for last place beyond results
-                length_of_index = self.faiss_index.ntotal
-                rank = length_of_index + 1
+        relation_targets = []
+        relation_results = []
+        relation_indexes = []
+
+        all_targets = []
+        all_results = []
+        all_indexes = []
+
+        # Prepare data for vectorized operations
+        sources = filtered_df["Source"].tolist()
+        question_vectors = [self.prepare_query_vector(source) for source in sources]
+        # for vec in question_vectors:
+        #     print(f"Individual vector shape: {vec.shape}")  # Check each vector's shape
+        batch_vectors = np.stack(question_vectors)
+        batch_vectors = batch_vectors.squeeze() # This removes any singleton dimensions
+
+        # print(f"Batch vectors shape: {batch_vectors.shape}")  # Final shape check before FAISS search
+        # Search in FAISS in batch
+        distances, indices = self.faiss_index.search(batch_vectors, vector_length)
+
+        for source_idx, (distance_row, index_row) in enumerate(zip(distances, indices)):
+            if filtered_df.iloc[source_idx]["objective"] == 'predict_tail':
+                target = filtered_df.iloc[source_idx]["tail"]
+                for distance, idx in zip(distance_row, index_row):
+                    full_result = self.metadata[idx] # Use scalar index
+                    predicted_result = full_result[4]  
+
+                    eval_result = predicted_result == target
+                    # if eval_result:
+                    #     print("true")
+                    tail_targets.append(eval_result)
+                    tail_results.append(distance)
+                    tail_indexes.append(source_idx)
+
+                    all_targets.append(eval_result)
+                    all_results.append(distance)
+                    all_indexes.append(source_idx)
+            elif filtered_df.iloc[source_idx]["objective"] == 'predict_head':
+                target = filtered_df.iloc[source_idx]["head"]
+                for distance, idx in zip(distance_row, index_row):
+                    full_result = self.metadata[idx] # Use scalar index
+                    predicted_result = full_result[1] 
+
+                    eval_result = predicted_result == target
+                    # if eval_result:
+                    #     print("true")
+                    head_targets.append(eval_result)
+                    head_results.append(distance)
+                    head_indexes.append(source_idx)
+
+                    all_targets.append(eval_result)
+                    all_results.append(distance)
+                    all_indexes.append(source_idx)
+
+            elif filtered_df.iloc[source_idx]["objective"] == 'predict_relation':
+                target = filtered_df.iloc[source_idx]["relation"]
+                for distance, idx in zip(distance_row, index_row):
+                    full_result = self.metadata[idx] # Use scalar index
+                    predicted_result = full_result[3] 
+                    # if eval_result:
+                    #     print("true")
+
+                    eval_result = predicted_result == target
+                    relation_targets.append(eval_result)
+                    relation_results.append(distance)
+                    relation_indexes.append(source_idx)
+
+                    all_targets.append(eval_result)
+                    all_results.append(distance)
+                    all_indexes.append(source_idx)
             
-            ranks_dict = defaultdict(list)
-            ranks_dict["ann_ranks"].append(rank)
-        ranks_dicts.append(ranks_dict)
-        return ranks_dicts
+        tail_targets_tensor = torch.tensor(tail_targets)
+        tail_results_tensor = torch.tensor(tail_results)
+        tail_indexes_tensor = torch.tensor(tail_indexes, dtype=torch.int64)
+
+        head_targets_tensor = torch.tensor(head_targets)
+        head_results_tensor = torch.tensor(head_results)
+        head_indexes_tensor = torch.tensor(head_indexes, dtype=torch.int64)
+
+        relation_targets_tensor = torch.tensor(relation_targets)
+        relation_results_tensor = torch.tensor(relation_results)
+        relation_indexes_tensor = torch.tensor(relation_indexes, dtype=torch.int64)
+
+        all_targets_tensor = torch.tensor(all_targets)
+        all_results_tensor = torch.tensor(all_results)
+        all_indexes_tensor = torch.tensor(all_indexes, dtype=torch.int64)
+
+        def compute_and_log(metric_name, metric_func, result_tensors, target_tensors, index_tensors, log_func):
+            metrics = {}
+            for label, results, targets, indexes in zip(
+                ['tail', 'head', 'relation', 'all'], result_tensors, target_tensors, index_tensors
+            ):
+                metric_result = metric_func(results, targets, indexes=indexes)
+                metrics[label] = metric_result.item()
+                log_func(f"{metric_name}_predict_{label}", metrics[label], prog_bar=True, logger=True)
+            return metrics
+
+        # Initialize metric functions
+        mrr = RetrievalMRR()
+        ndcg = RetrievalNormalizedDCG()
+        hr1 = RetrievalHitRate(top_k=1)
+        hr3 = RetrievalHitRate(top_k=3)
+        hr5 = RetrievalHitRate(top_k=5)
+        hr10 = RetrievalHitRate(top_k=10)
+
+        # Prepare the input tensors in the correct order
+        result_tensors = [tail_results_tensor, head_results_tensor, relation_results_tensor, all_results_tensor]
+        target_tensors = [tail_targets_tensor, head_targets_tensor, relation_targets_tensor, all_targets_tensor]
+        index_tensors = [tail_indexes_tensor, head_indexes_tensor, relation_indexes_tensor, all_indexes_tensor]
+
+        # Calculate and log the MRRs
+        mrrs = compute_and_log("mrr", mrr, result_tensors, target_tensors, index_tensors, self.log)
+
+        # Calculate and log the NDCGs
+        ndcgs = compute_and_log("ndcg", ndcg, result_tensors, target_tensors, index_tensors, self.log)
+
+        # Calculate and log the Hit Rates
+        hr1s = compute_and_log("hr1", hr1, result_tensors, target_tensors, index_tensors, self.log)
+        hr3s = compute_and_log("hr3", hr3, result_tensors, target_tensors, index_tensors, self.log)
+        hr5s = compute_and_log("hr5", hr5, result_tensors, target_tensors, index_tensors, self.log)
+        hr10s = compute_and_log("hr10", hr10, result_tensors, target_tensors, index_tensors, self.log)
+
+        # Print the results
+        print(f"Computed MRRs: Tail: {mrrs['tail']}, Head: {mrrs['head']}, Relation: {mrrs['relation']}, All: {mrrs['all']}")
+        print(f"Computed NDCGs: Tail: {ndcgs['tail']}, Head: {ndcgs['head']}, Relation: {ndcgs['relation']}, All: {ndcgs['all']}")
+        print(f"Computed Hit Rates (Top-1): Tail: {hr1s['tail']}, Head: {hr1s['head']}, Relation: {hr1s['relation']}, All: {hr1s['all']}")
+        print(f"Computed Hit Rates (Top-3): Tail: {hr3s['tail']}, Head: {hr3s['head']}, Relation: {hr3s['relation']}, All: {hr3s['all']}")
+        print(f"Computed Hit Rates (Top-5): Tail: {hr5s['tail']}, Head: {hr5s['head']}, Relation: {hr5s['relation']}, All: {hr5s['all']}")
+        print(f"Computed Hit Rates (Top-10): Tail: {hr10s['tail']}, Head: {hr10s['head']}, Relation: {hr10s['relation']}, All: {hr10s['all']}")
 
     def clean_text(self, text):
         # if text == "<tail>splash, water and dust resistant</tail>": # Used just for testing
@@ -744,98 +940,6 @@ class KBModel(pl.LightningModule):
         stripped = cleaned_text.strip()
         return stripped
 
-    def compute_model_mrr(self, batch, dataset, ranks_dicts):
-        input_batch = {
-            'input_ids': batch['source_token_ids'], 
-            'attention_mask': batch['attention_mask'],
-            'temperature': 1,  # TODO: make this argument?
-            'do_sample': True,
-            'num_return_sequences': self.num_predictions,
-            'num_beams': 1,
-            'eos_token_id': self.tokenizer.eos_token_id,
-            'pad_token_id': self.tokenizer.pad_token_id,
-            'max_length': self.max_output_length,
-            'output_scores': True,
-            'return_dict_in_generate': True,
-            'max_length': 40
-        }
-       
-        outputs = self.forward(source_token_ids=batch['source_token_ids'], 
-                            attention_mask=batch['attention_mask'], 
-                            target_token_ids=batch['target_token_ids'])
-        loss = outputs.loss
-        outputs = self.model.generate(**input_batch)#, max_new_tokens=128) # Run through decoder layer for evaluation
-        # for pred in outputs[0]:
-        #     print(self.tokenizer.decode(pred, skip_special_tokens=True))
-        sequences = outputs.sequences
-        # sequences has row count = self.num_predictions x batch_size
-        # scores has tensor for each character. Each tensor is (self.num_predictions x batch_size) in rows, vocab_size in columns
-        #print(f"Sequences: {sequences}")
-        predictions: List[str] = self.tokenizer.batch_decode(sequences, skip_special_tokens=True)
-        ranks_dict = defaultdict(list)
-        target_token_ids = batch["target_token_ids"]
-        objectives = batch["objective"]
-        heads = batch["head"]
-        head_descriptions = batch["head_description"]
-        relation = batch["relation"]
-        tails = batch["tail"]
-        tail_descriptions = batch["tail_description"]
-        sources = batch["source"]
-        targets = batch["target"]
-        
-
-        for idx, (source, target, objective) in enumerate(zip(sources, targets, objectives)):
-            predictions_for_batch = predictions[idx * self.num_predictions : (idx + 1) * self.num_predictions]
-            cleaned_predictions = [self.clean_text(pred) for pred in predictions_for_batch]
-            preds = np.array(cleaned_predictions)
-            true_pos = (preds == self.clean_text(target)).nonzero()[0]
-            if len(true_pos) == 0:
-                ranks_dict["model_ranks"].append(dataset.num_entities)
-                if objective == "predict_tail":
-                    ranks_dict["tail_ranks"].append(dataset.num_entities)
-                elif objective == "predict_head":
-                    ranks_dict["head_ranks"].append(dataset.num_entities)
-                elif objective == "predict_relation":
-                    ranks_dict["relation_ranks"].append(dataset.num_entities)
-                elif objective == "mlm":
-                    ranks_dict["mlm_ranks"].append(dataset.num_entities)
-                else:
-                    raise NotImplementedError("evaluating other objectives not implemented yet")
-                ranks_dicts.append(ranks_dict)
-            else:
-                scores = outputs.scores
-                scores = self.get_scores(sequences, scores)
-                true_pos = true_pos[0] # We only need the first logprob since they're all identical for the same text
-                true_score = scores[idx * self.num_predictions + true_pos]
-                unique_preds, unique_indices = np.unique(preds, return_index=True)
-                relevant_scores = scores[idx * self.num_predictions : (idx + 1) * self.num_predictions][unique_indices] # i.e. get the unique scores from slice for this batch
-                # true_answers = self.dataset.filter_dict[source] # true_answers would be to check aliases as well
-                rank = 0
-                ties = 0
-                for prediction, score in zip(unique_preds.tolist(), relevant_scores.tolist()):
-                    if self.clean_text(prediction) == self.clean_text(target): # if p in true_answers: # true_answers would be to check aliases as well. Same with commented out line below.
-                        continue
-                    # if self.dataset.entity_inverse_alias_dict.get(prediction, None) is None:
-                    #     continue
-                    if score > true_score: # This means some value was ranked higher than our match (based on their logprobs)
-                        rank += 1
-                    if score == true_score:
-                        ties += 1
-
-                ranks_dict["model_ranks"].append(rank + ties // 2 + 1)
-                if objective == "predict_tail":
-                    ranks_dict["tail_ranks"].append(rank + ties // 2 + 1)
-                elif objective == "predict_head":
-                    ranks_dict["head_ranks"].append(rank + ties // 2 + 1)
-                elif objective == "predict_relation":
-                    ranks_dict["relation_ranks"].append(rank + ties // 2 + 1)
-                elif objective == "mlm":
-                    ranks_dict["mlm_ranks"].append(rank + ties // 2 + 1)
-                else:
-                    raise NotImplementedError("evaluating other objectives not implemented yet")
-                ranks_dicts.append(ranks_dict)
-        return ranks_dicts
-
     def evaluate(self, batch, mode='val'):
         ranks_dicts = []
 
@@ -846,19 +950,15 @@ class KBModel(pl.LightningModule):
         elif mode == "train":
             dataset = self.train_dataset
 
-        #ranks_dicts = self.compute_vector_search_mrr(dataset, ranks_dicts)
-        ranks_dicts = self.compute_model_mrr(batch, dataset, ranks_dicts)
+        ranks_dicts = self.compute_vector_search_mrr(dataset, batch)
+        #ranks_dicts = self.compute_model_mrr(batch, dataset, ranks_dicts)
 
         self.ranks_dicts = ranks_dicts
         return ranks_dicts
-            # compute mrr from how closely the results matched tail
-
-
-
-        # Derived from: https://github.com/uma-pi1/kgt5-context/blob/main/kgt5_model.py
-        
-
-        # parsing the input
+    
+    def evaluate_all(self):
+        dataset = self.test_dataset
+        self.compute_vector_search_mrr(dataset)
         
 
     def generate(self, **kwargs):
@@ -893,49 +993,49 @@ class KBModel(pl.LightningModule):
                             target_token_ids=target_token_ids)
         loss = outputs.loss
         self.log("test_loss", loss, prog_bar=True, logger=True)
-        return self.evaluate(batch, mode='test')
+        return loss # self.evaluate(batch, mode='test')
 
-    def metric_aggregation(self, ranks_dicts):
-        ranks = np.array([rd["model_ranks"] for rd in self.ranks_dicts]).squeeze()
-        head_ranks = np.array([rd["head_ranks"] for rd in self.ranks_dicts if len(rd["head_ranks"]) > 0]).squeeze()
-        tail_ranks = np.array([rd["tail_ranks"] for rd in self.ranks_dicts if len(rd["tail_ranks"]) > 0]).squeeze()
-        #mlm_ranks = np.array([rd["mlm_ranks"] for rd in self.ranks_dicts if len(rd["mlm_ranks"]) > 0]).squeeze()
-        relation_ranks = np.array([rd["relation_ranks"] for rd in self.ranks_dicts if len(rd["relation_ranks"]) > 0]).squeeze()
-        ann_ranks = np.array([rd["ann_ranks"] for rd in self.ranks_dicts if len(rd["ann_ranks"]) > 0]).squeeze()
+    # def metric_aggregation(self, ranks_dicts):
+    #     ranks = np.array([rd["model_ranks"] for rd in self.ranks_dicts]).squeeze()
+    #     head_ranks = np.array([rd["head_ranks"] for rd in self.ranks_dicts if len(rd["head_ranks"]) > 0]).squeeze()
+    #     tail_ranks = np.array([rd["tail_ranks"] for rd in self.ranks_dicts if len(rd["tail_ranks"]) > 0]).squeeze()
+    #     #mlm_ranks = np.array([rd["mlm_ranks"] for rd in self.ranks_dicts if len(rd["mlm_ranks"]) > 0]).squeeze()
+    #     relation_ranks = np.array([rd["relation_ranks"] for rd in self.ranks_dicts if len(rd["relation_ranks"]) > 0]).squeeze()
+    #     ann_ranks = np.array([rd["ann_ranks"] for rd in self.ranks_dicts if len(rd["ann_ranks"]) > 0]).squeeze()
 
-        for r, suffix in zip([ranks, head_ranks, tail_ranks, relation_ranks, ann_ranks], ["", "_head", "_tail", "_relation", "_ann"]):
-            if len(r) != 0:
-                mrr = np.mean(1/r).item()
-                h1 = np.mean(r <= 1).item()
-                h3 = np.mean(r <= 3).item()
-                h10 = np.mean(r <= 10).item()
-            else:
-                mrr = 0.0
-                h1 = 0.0
-                h3 = 0.0
-                h10 = 0.0
-            self.log(f"mrr{suffix}", mrr)
-            self.log(f"h1{suffix}", h1)
-            self.log(f"h3{suffix}", h3)
-            self.log(f"h10{suffix}", h10)
-            print(f"\nmrr{suffix}", mrr)
-            print(f"h1{suffix}", h1)
-            print(f"h3{suffix}", h3)
-            print(f"h10{suffix}", h10)
+    #     for r, suffix in zip([ranks, head_ranks, tail_ranks, relation_ranks, ann_ranks], ["", "_head", "_tail", "_relation", "_ann"]):
+    #         if len(r) != 0:
+    #             mrr = np.mean(1/r).item()
+    #             h1 = np.mean(r <= 1).item()
+    #             h3 = np.mean(r <= 3).item()
+    #             h10 = np.mean(r <= 10).item()
+    #         else:
+    #             mrr = 0.0
+    #             h1 = 0.0
+    #             h3 = 0.0
+    #             h10 = 0.0
+    #         self.log(f"mrr{suffix}", mrr)
+    #         self.log(f"h1{suffix}", h1)
+    #         self.log(f"h3{suffix}", h3)
+    #         self.log(f"h10{suffix}", h10)
+    #         print(f"\nmrr{suffix}", mrr)
+    #         print(f"h1{suffix}", h1)
+    #         print(f"h3{suffix}", h3)
+    #         print(f"h10{suffix}", h10)
 
-    def on_test_epoch_end(self):
-        return self.metric_aggregation(self.ranks_dicts)
+    # def on_test_epoch_end(self):
+    #     return self.metric_aggregation(self.ranks_dicts)
 
 
 def main():
     # Used at eval
     tokenizer = T5Tokenizer.from_pretrained('t5-small')
     tokenizer.add_tokens(special_tokens)  
-    data_module = DataModuleWith_Tail_NoMLM(tokenizer, batch_size=batch_size)
+    data_module = DataModuleWith_Tail_OneSep(tokenizer, batch_size=batch_size)
     data_module.setup()
     
-    model = KBModel(data_module=data_module, special_tokens=special_tokens)
-    #model = KBModel.load_from_checkpoint("/teamspace/jobs/t5-knowledge-graph-pretrain-v3-predict-tail-no-mlm-actually-pretrained/nodes.0/kg_logs_v4/knowledge_tuples_T5_knowledge_graph_pretrain_v3_predict_tail_no_mlm/version_0/checkpoints/epoch=2-step=972.ckpt", data_module=data_module, special_tokens=special_tokens)
+    #model = KBModel(data_module=data_module, special_tokens=special_tokens)
+    model = KBModel.load_from_checkpoint("/teamspace/jobs/t5-knowledge-graph-pretrain-v3-predict-tail-one-sep/nodes.0/kg_logs_v4/knowledge_tuples_T5_knowledge_graph_pretrain_v3_predict_tail_one_sep/version_2/checkpoints/epoch=1-step=970.ckpt", data_module=data_module, special_tokens=special_tokens)
     from lightning.pytorch.loggers import TensorBoardLogger
     logger = TensorBoardLogger("kg_logs_v4", name=filename + "_" + suffix)
 
@@ -946,9 +1046,11 @@ def main():
                         callbacks=[ModelCheckpoint(monitor="val_loss"),
                                     EarlyStopping(monitor="val_loss", patience=3)],
                         logger=logger,
-                        precision="bf16-mixed")
+                        precision="16-mixed")
 
     trainer.fit(model, datamodule=data_module)
+    model.write_to_faiss()
+    model.evaluate_all()
     trainer.test(model=model, datamodule=data_module)
 
 
