@@ -28,6 +28,8 @@ seed = 42
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
+# For debugging:
+torch.set_printoptions(profile="full")
 
 # If you are using CUDA (GPU), also set this for reproducibility
 torch.cuda.manual_seed(seed)
@@ -442,6 +444,8 @@ class KBModel(pl.LightningModule):
         # Variables to track success score and total attempts for accuracy calculation
         self.address_success_score = 0
         self.address_total = 0
+
+        self.index_built = False
         
     def forward(self, source_token_ids, attention_mask=None, target_token_ids=None):
         return self.model(input_ids=source_token_ids, attention_mask=attention_mask, labels=target_token_ids)
@@ -487,20 +491,6 @@ class KBModel(pl.LightningModule):
         final_scores = final_logits.sum(dim=-1) # Sum the probabilities for each token
 
         return final_scores
-
-    # def prepare_query_vector(self, query_text):
-    #     tokenized_query = self.tokenizer(query_text, return_tensors='pt', padding=True, truncation=True, max_length=512).to('cuda')
-    #     input_ids = tokenized_query['input_ids'].to('cuda')
-    #     attention_mask = tokenized_query['attention_mask'].to('cuda')
-    #     with torch.no_grad():  # Ensure model is in eval mode and no gradients are computed
-    #         outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
-    #         #outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-    #         last_hidden_state = outputs.last_hidden_state
-
-    #         # Extract the first token from the decoder's outputs (assuming batch_first=True)
-    #         embeddings = last_hidden_state[:, 0, :].cpu().numpy() 
-    #     #return pooled_embeddings.cpu().numpy()  # # Pooling over the sequence dimension. Then, convert tensor to numpy array
-    #     return embeddings
 
     def generate_question_prompt(self) -> PromptTemplate:
         prompt = (
@@ -556,107 +546,15 @@ class KBModel(pl.LightningModule):
         return df
 
     def prepare_query_vector(self, query_text):
-        #query_text = ['<cls>predict tail: Head: Newphoria<sep>An online retailer offering the iPhone 15 on a promotional deal<sep>Relation: provides promotion<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Get it on us<sep>A promotional offer where customers can get the iPhone 15 for free<sep>Relation: is available through<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Verizon<sep>Verizon is a telecommunications company that provides wireless services, devices, and support to customers.<sep>Relation: no longer supports<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Verizon<sep>Verizon is a telecommunications company that provides wireless services, devices, and support to customers.<sep>Relation: no longer supports<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Verizon<sep>Verizon is a telecommunications company that provides wireless services, devices, and support to customers.<sep>Relation: no longer supports<sep>Tail: <tail><sep>', '<cls>predict tail: Head: Verizon<sep>Verizon is a telecommunications company that provides wireless services, devices, and support to customers.<sep>Relation: no longer supports<sep>Tail: <tail><sep>', '<cls>predict tail: Head: cellular carrier<sep>A company that provides wireless communication services to customers through the use of mobile devices such as smartphones and tablets.<sep>Relation: operated with<sep>Tail: <tail><sep>']
-        #test_query_text = '<cls>predict tail: Newphoria An online retailer offering the iPhone 15 on a promotional deal provides promotion<sep>Tail: <tail><sep>'
-        #test_query_text = '<cls>predict tail: What needs to be clarified about the smart hospital room?<sep>Tail: <tail><sep>'
         tokenized_query = self.tokenizer(query_text, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
         input_ids = tokenized_query['input_ids'].to('cuda')
         attention_mask = tokenized_query['attention_mask'].to('cuda')
 
-        # input_batch = {
-        #     'input_ids': input_ids, 
-        #     'attention_mask': attention_mask,
-        #     'do_sample': False,
-        #     'num_beams': 1,
-        #     'eos_token_id': self.tokenizer.eos_token_id,
-        #     'pad_token_id': self.tokenizer.pad_token_id,
-        #     'max_length': self.max_output_length,
-        #     'output_scores': True,
-        #     'return_dict_in_generate': True,
-        #     'output_hidden_states': True,
-        # }
-        # # input_batch = {
-        # #     'input_ids': input_ids, 
-        # #     'attention_mask': attention_mask,
-        # #     'temperature': 1,  # TODO: make this argument?
-        # #     'do_sample': True,
-        # #     'num_return_sequences': self.num_predictions,
-        # #     'num_beams': 1,
-        # #     'eos_token_id': self.tokenizer.eos_token_id,
-        # #     'pad_token_id': self.tokenizer.pad_token_id,
-        # #     'max_length': self.max_output_length,
-        # #     'output_scores': True,
-        # #     'return_dict_in_generate': True,
-        # #     'max_length': 20
-        # # }
-        # # outputs = self.model.generate(**input_batch)
-        # # sequences = outputs.sequences
-        # # predictions: List[str] = self.tokenizer.batch_decode(sequences, skip_special_tokens=True)
-
-        # # tokens_hidden_states = outputs.decoder_hidden_states[-1]
-        # # last_hidden_layer = tokens_hidden_states[-1]
-
-        # # # Compute the mean of the hidden states across the sequence length dimension
-        # # mean_pooled_output = torch.mean(last_hidden_layer, dim=1, keepdim=False).detach().cpu().numpy()
-
-        # outputs = self.model.generate(**input_batch)
-
-        # # tokens_hidden_states = outputs.decoder_hidden_states[-1]
-        # # last_hidden_layer = tokens_hidden_states[-1]
-        # ## Compute the mean of the hidden states across the sequence length dimension
-        # # mean_pooled_output = torch.mean(last_hidden_layer, dim=1, keepdim=False).detach().cpu().numpy()
-
-        # # Extract the last tensors from each tuple
-        # last_tensors = [hidden_state_tuple[-1] for hidden_state_tuple in outputs.decoder_hidden_states]
-
-        # # Stack all the last tensors along a new dimension (layer axis)
-        # stacked_last_tensors = torch.stack(last_tensors, dim=0)
-
-        # # Take the mean across the new first dimension (layers)
-        # mean_pooled_output = torch.mean(stacked_last_tensors, dim=0).detach().cpu().numpy()
-
-        # flattened_output = mean_pooled_output.squeeze(axis=1)
-
-        # input_batch = {
-        #     'input_ids': input_ids, 
-        #     'attention_mask': attention_mask,
-        #     'do_sample': False,
-        #     'num_beams': 1,
-        #     'eos_token_id': self.tokenizer.eos_token_id,
-        #     'pad_token_id': self.tokenizer.pad_token_id,
-        #     'max_length': self.max_output_length,
-        #     'output_scores': True,
-        #     'return_dict_in_generate': True,
-        #     'output_hidden_states': True,
-        # }
-        # outputs = self.model.generate(**input_batch)
-
-        # tokens_hidden_states = outputs.decoder_hidden_states[-1] # Should correspond to last decode step
-        # last_hidden_layer = tokens_hidden_states[-1] # Should correspond to last layer
-
-        # # ## Compute the mean of the hidden states across the sequence length dimension
-        # mean_pooled_output = torch.mean(last_hidden_layer, dim=1, keepdim=False).detach().cpu().numpy()
-        # return mean_pooled_output
-
-        ################
-        # This code was working:
         with torch.no_grad():  # Ensure model is in eval mode and no gradients are computed
             encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
             embeddings = encoder_outputs.last_hidden_state
             pooled_embeddings = torch.mean(embeddings, dim=1)  # Pooling over the sequence dimension
         return pooled_embeddings.cpu().numpy()  # Convert tensor to numpy array
-
-
-        # return mean_pooled_output
-
-        # with torch.no_grad():  # Ensure model is in eval mode and no gradients are computed
-        #     decoder_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        #     first_token_hidden_state = decoder_outputs.decoder_hidden_states[-1][:, 0, :]
-        #     first_token_vector = first_token_hidden_state.detach().cpu().numpy()
-        #     # encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        #     # embeddings = encoder_outputs.last_hidden_state
-        #     # pooled_embeddings = torch.mean(embeddings, dim=1)  # Pooling over the sequence dimension
-        # return first_token_vector #pooled_embeddings.cpu().numpy()  # Convert tensor to numpy array
 
     def write_to_faiss(self, batch_size=20):
         with torch.no_grad():
@@ -684,100 +582,21 @@ class KBModel(pl.LightningModule):
                 
                 # Prepare batch data
                 sources = batch_df['Source'].tolist()
-                tokenized_input = self.tokenizer(sources, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
-                input_ids = tokenized_input['input_ids'].to('cuda')
-                attention_mask = tokenized_input['attention_mask'].to('cuda')
-
-                # ### Debugging
-                # input_batch2 = {
-                #     'input_ids': input_ids, 
-                #     'attention_mask': attention_mask,
-                #     'temperature': 1,  # TODO: make this argument?
-                #     'do_sample': True,
-                #     'num_return_sequences': self.num_predictions,
-                #     'num_beams': 1,
-                #     'eos_token_id': self.tokenizer.eos_token_id,
-                #     'pad_token_id': self.tokenizer.pad_token_id,
-                #     'max_length': self.max_output_length,
-                #     'output_scores': True,
-                #     'return_dict_in_generate': True,
-                #     'max_length': 20
-                # }
-                # outputs2 = self.model.generate(**input_batch2)
-                # sequences2 = outputs2.sequences
-                # predictions: List[str] = self.tokenizer.batch_decode(sequences2, skip_special_tokens=True)
-                # ### End debugging
-
-                # input_batch = {
-                #     'input_ids': input_ids, 
-                #     'attention_mask': attention_mask,
-                #     'do_sample': False,
-                #     'num_beams': 1,
-                #     'eos_token_id': self.tokenizer.eos_token_id,
-                #     'pad_token_id': self.tokenizer.pad_token_id,
-                #     'max_length': self.max_output_length,
-                #     'output_scores': True,
-                #     'return_dict_in_generate': True,
-                #     'output_hidden_states': True,
-                # }
-                # outputs = self.model.generate(**input_batch)
-
-                # tokens_hidden_states = outputs.decoder_hidden_states[-1] # Should correspond to last decode step
-                # last_hidden_layer = tokens_hidden_states[-1] # Should correspond to last layer
-
-                # # ## Compute the mean of the hidden states across the sequence length dimension
-                # mean_pooled_output = torch.mean(last_hidden_layer, dim=1, keepdim=False).detach().cpu().numpy()
-
-                # # Extract the last tensors from each tuple
-                # last_tensors = [hidden_state_tuple[-1] for hidden_state_tuple in outputs.decoder_hidden_states]
-
-                # # Stack all the last tensors along a new dimension (layer axis)
-                # stacked_last_tensors = torch.stack(last_tensors, dim=0)
-
-                # # Take the mean across the new first dimension (layers)
-                # mean_pooled_output = torch.mean(stacked_last_tensors, dim=0).detach().cpu().numpy()
-
-                # flattened_output = mean_pooled_output.squeeze(axis=1)
-
-                # Teacher forcing approach:
-                # targets = batch_df['Target'].tolist()
-                # tokenized_target = self.tokenizer(targets, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
-                # target_ids = tokenized_target['input_ids'].to('cuda')
-
-                # # Get encoder outputs
-                # encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
-                # embeddings = encoder_outputs.last_hidden_state
+                tokenized_input = self.tokenizer(sources, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to(self.device)
+                input_ids = tokenized_input['input_ids'].to(self.device)
+                attention_mask = tokenized_input['attention_mask'].to(self.device)
                 
-                # # Pool embeddings over the sequence dimension
-                # pooled_embeddings = torch.mean(embeddings, dim=1).cpu().numpy()  # Convert to numpy array for FAISS
-
-                # Approach involving first decoder token:
-                # decoder_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids, output_hidden_states=True)
-                # first_token_hidden_state = decoder_outputs.decoder_hidden_states[-1][:, 0, :]
-                # first_token_vector = first_token_hidden_state.detach().cpu().numpy()
-                
-                # Add embeddings to FAISS index in batch
-                #sentences = embedding_model_test.encode(sources)
-
-                # Get encoder outputs
-
-                #############
-                # This section was working:
                 encoder_outputs = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
                 embeddings = encoder_outputs.last_hidden_state
                 
                 # Pool embeddings over the sequence dimension
                 mean_pooled_output = torch.mean(embeddings, dim=1).detach().cpu().numpy()  # Convert to numpy array for FAISS
-                #############
-                
 
                 self.faiss_index.add(mean_pooled_output)
-                #self.faiss_index.add(mean_pooled_output)
 
                 # Store metadata associated with embeddings
                 metadata_entries = batch_df.apply(lambda row: (row['objective'], row['head'], row['head_description'],
                                                             row['relation'], row['tail'], row['tail_description']), axis=1).tolist()
-                # Does apply preserve order?
                 self.metadata.extend(metadata_entries)
 
             print("FAISS indexing complete and metadata stored.")
@@ -831,11 +650,11 @@ class KBModel(pl.LightningModule):
                     # if eval_result:
                     #     print("true")
                     tail_targets.append(eval_result)
-                    tail_results.append(distance)
+                    tail_results.append(1-distance) # Must be passed as similarities to ensure they're sorted correctly.
                     tail_indexes.append(source_idx)
 
                     all_targets.append(eval_result)
-                    all_results.append(distance)
+                    all_results.append(1-distance)
                     all_indexes.append(source_idx)
             elif filtered_df.iloc[source_idx]["objective"] == 'predict_head':
                 target = filtered_df.iloc[source_idx]["head"]
@@ -847,11 +666,11 @@ class KBModel(pl.LightningModule):
                     # if eval_result:
                     #     print("true")
                     head_targets.append(eval_result)
-                    head_results.append(distance)
+                    head_results.append(1-distance)
                     head_indexes.append(source_idx)
 
                     all_targets.append(eval_result)
-                    all_results.append(distance)
+                    all_results.append(1-distance)
                     all_indexes.append(source_idx)
 
             elif filtered_df.iloc[source_idx]["objective"] == 'predict_relation':
@@ -864,54 +683,65 @@ class KBModel(pl.LightningModule):
 
                     eval_result = predicted_result == target
                     relation_targets.append(eval_result)
-                    relation_results.append(distance)
+                    relation_results.append(1-distance)
                     relation_indexes.append(source_idx)
 
                     all_targets.append(eval_result)
-                    all_results.append(distance)
+                    all_results.append(1-distance)
                     all_indexes.append(source_idx)
             
         tail_targets_tensor = torch.tensor(tail_targets)
-        tail_results_tensor = torch.tensor(tail_results)
+        tail_preds_tensor = torch.tensor(tail_results)
         tail_indexes_tensor = torch.tensor(tail_indexes, dtype=torch.int64)
 
         head_targets_tensor = torch.tensor(head_targets)
-        head_results_tensor = torch.tensor(head_results)
+        head_preds_tensor = torch.tensor(head_results)
         head_indexes_tensor = torch.tensor(head_indexes, dtype=torch.int64)
 
         relation_targets_tensor = torch.tensor(relation_targets)
-        relation_results_tensor = torch.tensor(relation_results)
+        relation_preds_tensor = torch.tensor(relation_results)
         relation_indexes_tensor = torch.tensor(relation_indexes, dtype=torch.int64)
 
         all_targets_tensor = torch.tensor(all_targets)
-        all_results_tensor = torch.tensor(all_results)
+        all_preds_tensor = torch.tensor(all_results)
         all_indexes_tensor = torch.tensor(all_indexes, dtype=torch.int64)
 
-        def compute_and_log(metric_name, metric_func, result_tensors, target_tensors, index_tensors, log_func):
+        def compute_and_log(metric_name, metric_func, preds_tensors, target_tensors, index_tensors, log_func):
             metrics = {}
-            for label, results, targets, indexes in zip(
-                ['tail', 'head', 'relation', 'all'], result_tensors, target_tensors, index_tensors
+            for label, preds, targets, indexes in zip(
+                ['tail', 'head', 'relation', 'all'], preds_tensors, target_tensors, index_tensors
             ):
-                metric_result = metric_func(results, targets, indexes=indexes)
+                metric_result = metric_func(preds, targets, indexes=indexes)
                 metrics[label] = metric_result.item()
                 log_func(f"{metric_name}_predict_{label}", metrics[label], prog_bar=True, logger=True)
             return metrics
 
         # Initialize metric functions
         mrr = RetrievalMRR()
+        mrr1 = RetrievalMRR(top_k=1)
+        mrr3 = RetrievalMRR(top_k=3)
+        mrr5 = RetrievalMRR(top_k=5)
+        mrr10 = RetrievalMRR(top_k=10)
+
         ndcg = RetrievalNormalizedDCG()
+
         hr1 = RetrievalHitRate(top_k=1)
         hr3 = RetrievalHitRate(top_k=3)
         hr5 = RetrievalHitRate(top_k=5)
         hr10 = RetrievalHitRate(top_k=10)
 
         # Prepare the input tensors in the correct order
-        result_tensors = [tail_results_tensor, head_results_tensor, relation_results_tensor, all_results_tensor]
+        result_tensors = [tail_preds_tensor, head_preds_tensor, relation_preds_tensor, all_preds_tensor]
         target_tensors = [tail_targets_tensor, head_targets_tensor, relation_targets_tensor, all_targets_tensor]
         index_tensors = [tail_indexes_tensor, head_indexes_tensor, relation_indexes_tensor, all_indexes_tensor]
 
         # Calculate and log the MRRs
         mrrs = compute_and_log("mrr", mrr, result_tensors, target_tensors, index_tensors, self.log)
+
+        mrr1s = compute_and_log("mrr1", mrr1, result_tensors, target_tensors, index_tensors, self.log)
+        mrr3s = compute_and_log("mrr3", mrr3, result_tensors, target_tensors, index_tensors, self.log)
+        mrr5s = compute_and_log("mrr5", mrr5, result_tensors, target_tensors, index_tensors, self.log)
+        mrr10s = compute_and_log("mrr10", mrr10, result_tensors, target_tensors, index_tensors, self.log)
 
         # Calculate and log the NDCGs
         ndcgs = compute_and_log("ndcg", ndcg, result_tensors, target_tensors, index_tensors, self.log)
@@ -924,7 +754,13 @@ class KBModel(pl.LightningModule):
 
         # Print the results
         print(f"Computed MRRs: Tail: {mrrs['tail']}, Head: {mrrs['head']}, Relation: {mrrs['relation']}, All: {mrrs['all']}")
+        print(f"Computed MRRs (Top-1): Tail: {mrr1s['tail']}, Head: {mrr1s['head']}, Relation: {mrr1s['relation']}, All: {mrr1s['all']}")
+        print(f"Computed MRRs (Top-3): Tail: {mrr3s['tail']}, Head: {mrr3s['head']}, Relation: {mrr3s['relation']}, All: {mrr3s['all']}")
+        print(f"Computed MRRs (Top-5): Tail: {mrr5s['tail']}, Head: {mrr5s['head']}, Relation: {mrr5s['relation']}, All: {mrr5s['all']}")
+        print(f"Computed MRRs (Top-10): Tail: {mrr10s['tail']}, Head: {mrr10s['head']}, Relation: {mrr10s['relation']}, All: {mrr10s['all']}")
+
         print(f"Computed NDCGs: Tail: {ndcgs['tail']}, Head: {ndcgs['head']}, Relation: {ndcgs['relation']}, All: {ndcgs['all']}")
+
         print(f"Computed Hit Rates (Top-1): Tail: {hr1s['tail']}, Head: {hr1s['head']}, Relation: {hr1s['relation']}, All: {hr1s['all']}")
         print(f"Computed Hit Rates (Top-3): Tail: {hr3s['tail']}, Head: {hr3s['head']}, Relation: {hr3s['relation']}, All: {hr3s['all']}")
         print(f"Computed Hit Rates (Top-5): Tail: {hr5s['tail']}, Head: {hr5s['head']}, Relation: {hr5s['relation']}, All: {hr5s['all']}")
@@ -978,9 +814,6 @@ class KBModel(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True, logger=True)
         #return self.evaluate(batch, mode='val') 
         return loss 
-    
-    # def on_validation_epoch_end(self):
-    #     return self.metric_aggregation(self.ranks_dicts)
 
     def test_step(self, batch, batch_idx):
         source_token_ids = batch['source_token_ids']
@@ -993,39 +826,13 @@ class KBModel(pl.LightningModule):
                             target_token_ids=target_token_ids)
         loss = outputs.loss
         self.log("test_loss", loss, prog_bar=True, logger=True)
-        return loss # self.evaluate(batch, mode='test')
 
-    # def metric_aggregation(self, ranks_dicts):
-    #     ranks = np.array([rd["model_ranks"] for rd in self.ranks_dicts]).squeeze()
-    #     head_ranks = np.array([rd["head_ranks"] for rd in self.ranks_dicts if len(rd["head_ranks"]) > 0]).squeeze()
-    #     tail_ranks = np.array([rd["tail_ranks"] for rd in self.ranks_dicts if len(rd["tail_ranks"]) > 0]).squeeze()
-    #     #mlm_ranks = np.array([rd["mlm_ranks"] for rd in self.ranks_dicts if len(rd["mlm_ranks"]) > 0]).squeeze()
-    #     relation_ranks = np.array([rd["relation_ranks"] for rd in self.ranks_dicts if len(rd["relation_ranks"]) > 0]).squeeze()
-    #     ann_ranks = np.array([rd["ann_ranks"] for rd in self.ranks_dicts if len(rd["ann_ranks"]) > 0]).squeeze()
+        if not self.index_built:
+            self.write_to_faiss()
+            self.evaluate_all()
+            self.index_built = True
 
-    #     for r, suffix in zip([ranks, head_ranks, tail_ranks, relation_ranks, ann_ranks], ["", "_head", "_tail", "_relation", "_ann"]):
-    #         if len(r) != 0:
-    #             mrr = np.mean(1/r).item()
-    #             h1 = np.mean(r <= 1).item()
-    #             h3 = np.mean(r <= 3).item()
-    #             h10 = np.mean(r <= 10).item()
-    #         else:
-    #             mrr = 0.0
-    #             h1 = 0.0
-    #             h3 = 0.0
-    #             h10 = 0.0
-    #         self.log(f"mrr{suffix}", mrr)
-    #         self.log(f"h1{suffix}", h1)
-    #         self.log(f"h3{suffix}", h3)
-    #         self.log(f"h10{suffix}", h10)
-    #         print(f"\nmrr{suffix}", mrr)
-    #         print(f"h1{suffix}", h1)
-    #         print(f"h3{suffix}", h3)
-    #         print(f"h10{suffix}", h10)
-
-    # def on_test_epoch_end(self):
-    #     return self.metric_aggregation(self.ranks_dicts)
-
+        return loss
 
 def main():
     # Used at eval
@@ -1033,9 +840,8 @@ def main():
     tokenizer.add_tokens(special_tokens)  
     data_module = DataModuleWith_Tail_OneSep(tokenizer, batch_size=batch_size)
     data_module.setup()
-    
     #model = KBModel(data_module=data_module, special_tokens=special_tokens)
-    model = KBModel.load_from_checkpoint("/teamspace/jobs/t5-knowledge-graph-pretrain-v3-predict-tail-one-sep/nodes.0/kg_logs_v4/knowledge_tuples_T5_knowledge_graph_pretrain_v3_predict_tail_one_sep/version_2/checkpoints/epoch=1-step=970.ckpt", data_module=data_module, special_tokens=special_tokens)
+    model = KBModel.load_from_checkpoint("/teamspace/jobs/t5-knowledge-graph-pretrain-v3-predict-all-torchmetrics-2/nodes.0/kg_logs_v4/knowledge_tuples_T5_knowledge_graph_pretrain_v3_predict_all_torchmetrics/version_1/checkpoints/epoch=0-step=1940.ckpt", data_module=data_module, special_tokens=special_tokens)
     from lightning.pytorch.loggers import TensorBoardLogger
     logger = TensorBoardLogger("kg_logs_v4", name=filename + "_" + suffix)
 
@@ -1048,10 +854,11 @@ def main():
                         logger=logger,
                         precision="16-mixed")
 
-    trainer.fit(model, datamodule=data_module)
-    model.write_to_faiss()
-    model.evaluate_all()
+    #trainer.fit(model, datamodule=data_module)
+    # model.write_to_faiss()
+    # model.evaluate_all()
     trainer.test(model=model, datamodule=data_module)
+
 
 
 if __name__ == "__main__":
