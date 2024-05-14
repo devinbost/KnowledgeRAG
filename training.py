@@ -1,5 +1,3 @@
-# Used at eval
-# This version uses pretrained model as a base.
 import torch
 import asyncio
 from torch.utils.data import DataLoader, Dataset
@@ -48,7 +46,7 @@ model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-012
 # Run from terminal: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 
 filename = "knowledge_tuples"
-suffix = "T5_knowledge_graph_pretrain_v3_predict_all_torchmetrics"
+suffix = "T5_knowledge_graph_pretrain_v5_sep_metrics_embeddings"
 dataset_prefix = "DataModuleWith_Tail_OneSep"
 # Used at eval
 save_path = '/teamspace/studios/this_studio/data/'
@@ -57,14 +55,7 @@ save_path = '/teamspace/studios/this_studio/data/'
 special_tokens = [
     "<cls>", "<mask>", "<end>", "<sep>", "<head>", "<tail>", "<relation>"
 ]
-# for i in range(1, 151):
-#     special_tokens.append(f"<x{i}>") # These are used for MLM
 
-# special_tokens = [
-#     "<cls>", "<head>", "<head_description>", "</head_description>", "<mask>","<relation>", "<tail>", "<tail_description>","</tail_description>","<relation>", "<end>"
-# ]
-# for i in range(1, 151):
-#     special_tokens.append(f"<x{i}>") # These are used for MLM
 df_size_limit = 10
 
 import lightning as pl
@@ -303,81 +294,6 @@ class DataModuleWith_Tail_OneSep(pl.LightningDataModule):
 
         return selected_parts
 
-    def generate_word_masks(self, head, head_description, relation, tail, tail_description, percentage):
-        combined = f"{head} {head_description} {relation} {tail} {tail_description}"
-        head_parts = head.split()
-        head_description_parts = head_description.split()
-        relation_parts = relation.split()
-        tail_parts = tail.split()
-        tail_description_parts = tail_description.split()
-        combined_text_parts = head_parts + head_description_parts + relation_parts + tail_parts + tail_description_parts
-        #assert len(combined_text_parts) == len(combined.split())
-        positions = range(0, len(combined_text_parts))
-        words = [combined_text_parts[pos] for pos in positions]
-        tokens = [f"<x{pos}>" for pos in positions]
-        triples = zip(words, positions, tokens)
-        combined_parts = [Part(text=word, position=position, token=token, swapped=False) for word, position, token in
-                          triples]
-        combined_parts_dict = {part.position: part for part in combined_parts}
-        # Just for testing:
-        # sampled_parts = self.sample_parts(combined_parts, 100)
-        # recombined_parts = [word for word, _, _, _, _ in sampled_parts]
-        # assert len(recombined_parts) == len(combined_parts)
-
-        sampled_parts = self.sample_parts(combined_parts, percentage)
-        for part in sampled_parts:
-            combined_parts_dict[part.position] = Part(text=part.token, position=part.position, token=part.text,
-                                                      swapped=True)  # Swap text and token for the sampled word
-        combined_with_substitution: List[Part] = sorted(combined_parts_dict.values(), key=lambda item: item.position)
-        # Split combined_with_substitution into the buckets
-        # Function to check range and append to corresponding list
-        # Initialize the lists
-        head_upper_bound = len(head_parts)
-        head_description_upper_bound = len(head_description_parts) + head_upper_bound
-        relation_upper_bound = len(relation_parts) + head_description_upper_bound
-        tail_upper_bound = len(tail_parts) + relation_upper_bound
-        tail_description_upper_bound = len(tail_description_parts) + tail_upper_bound
-        head_range = (0, head_upper_bound)
-        head_description_range = (head_upper_bound, head_description_upper_bound)
-        relation_range = (head_description_upper_bound, relation_upper_bound)
-        tail_range = (relation_upper_bound, tail_upper_bound)
-        tail_description_range = (tail_upper_bound, tail_description_upper_bound)
-        sub_head_parts = []
-        sub_head_description_parts = []
-        sub_relation_parts = []
-        sub_tail_parts = []
-        sub_tail_description_parts = []
-        for part in combined_with_substitution:
-            if head_range[0] <= part.position < head_range[1]:
-                part.bucket = "head"
-                sub_head_parts.append(part)
-            elif head_description_range[0] <= part.position < head_description_range[1]:
-                part.bucket = "head_description"
-                sub_head_description_parts.append(part)
-            elif relation_range[0] <= part.position < relation_range[1]:
-                part.bucket = "relation"
-                sub_relation_parts.append(part)
-            elif tail_range[0] <= part.position < tail_range[1]:
-                part.bucket = "tail"
-                sub_tail_parts.append(part)
-            elif tail_description_range[0] <= part.position < tail_description_range[1]:
-                part.bucket = "tail_description"
-                sub_tail_description_parts.append(part)
-        target_tokens = []
-        for part in combined_with_substitution:
-            if part.swapped is True:
-                target_tokens.append(part.text)
-                target_tokens.append(part.token)
-        head_with_sub = ' '.join([part.text for part in sub_head_parts])
-        head_description_with_sub = ' '.join([part.text for part in sub_head_description_parts])
-        relation_with_sub = ' '.join([part.text for part in sub_relation_parts])
-        tail_with_sub = ' '.join([part.text for part in sub_tail_parts])
-        tail_description_with_sub = ' '.join([part.text for part in sub_tail_description_parts])
-        source_text = (f"<cls>Predict missing tokens: Head: {head_with_sub}"
-                       f"<head_description>{head_description_with_sub}</head_description>Relation: {relation_with_sub}. Tail: {tail_with_sub}<tail_description>{tail_description_with_sub}</tail_description>")
-        target_text = "".join(target_tokens) + "<end>"
-        return source_text, target_text
-
     def prepare_dataset(self, df):
         mem_head = df.apply(lambda x: pd.Series({"Source": f"<cls>predict head: Head: <head><sep>Relation: {x['relation']}<sep>Tail: {x['tail']}<sep>{x['tail_description']}<sep>",
                                                      "Target": f"<head>{x['head']}<end>",
@@ -492,59 +408,6 @@ class KBModel(pl.LightningModule):
 
         return final_scores
 
-    def generate_question_prompt(self) -> PromptTemplate:
-        prompt = (
-            "You're a text parser. Generate a question when given a source. For example, if your SOURCE is like the following EXAMPLE SOURCE, create a question like EXAMPLE QUESTION."
-            "EXAMPLE SOURCE:"
-            "Head: iPhone 15. Relation: requires"
-            "EXAMPLE QUESTION:"
-            "The iPhone 15 requires what?"
-            "ACTUAL SOURCE:"
-            "Head: {Head}. Relation: {Relation}."
-            "ACTUAL QUESTION:"
-            )
-        return PromptTemplate.from_template(prompt)
-
-    def build_question_creation_chain(self, model: ChatOpenAI) -> Runnable:
-        chain = (
-            {
-                "Head": itemgetter("head"),
-                "Relation": itemgetter("relation")
-            }
-            | self.generate_question_prompt()
-            | model
-            | StrOutputParser()
-            | RunnableLambda(lambda x: "<cls>predict tail:" + x + "<sep>Tail: <tail><sep>") #RunnableLambda(lambda x: "<cls>Predict tail: Head and relation: " + x + " Tail: <tail>")
-        )
-        return chain
-
-    async def async_invoke(self, question_generation_chain, head, relation):
-        # Simulate an async API call
-        # This function should be truly asynchronous and handle API calls or async operations
-        return await question_generation_chain.ainvoke({"head": head, "relation": relation})
-    
-    async def generate_topk_questions(self, model: ChatOpenAI, df, limit):
-        question_generation_chain = self.build_question_creation_chain(model)
-        # Use asyncio to gather results from asynchronous operations
-        df_topk = df.head(limit).reset_index(drop=True)
-        tasks = []
-        for index, row in tqdm(df_topk.iterrows(), total=len(df_topk), desc="Processing row in generate_topk_questions"):
-            task = asyncio.create_task(self.async_invoke(question_generation_chain, row['head'], row['relation']))
-            tasks.append(task)
-
-        # Await all tasks and get the results
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for idx, result in enumerate(results):
-            if isinstance(result, Exception):
-                # Handle the exception (log it, retry, or other error handling)
-                print("Error encountered:", result)
-                results[idx] = np.nan # Ensure the value isn't interpreted as a question
-
-        # Assign results back to the DataFrame
-        df['test_question'] = results
-
-        return df
-
     def prepare_query_vector(self, query_text):
         tokenized_query = self.tokenizer(query_text, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
         input_ids = tokenized_query['input_ids'].to('cuda')
@@ -602,7 +465,7 @@ class KBModel(pl.LightningModule):
             print("FAISS indexing complete and metadata stored.")
 
     
-    def compute_vector_search_mrr(self, dataset):
+    def compute_vector_search_mrr(self, dataset, metadata):
         # Index into vector search
 
         # Get top items randomly from DF
@@ -643,7 +506,7 @@ class KBModel(pl.LightningModule):
             if filtered_df.iloc[source_idx]["objective"] == 'predict_tail':
                 target = filtered_df.iloc[source_idx]["tail"]
                 for distance, idx in zip(distance_row, index_row):
-                    full_result = self.metadata[idx] # Use scalar index
+                    full_result = metadata[idx] # Use scalar index
                     predicted_result = full_result[4]  
 
                     eval_result = predicted_result == target
@@ -659,7 +522,7 @@ class KBModel(pl.LightningModule):
             elif filtered_df.iloc[source_idx]["objective"] == 'predict_head':
                 target = filtered_df.iloc[source_idx]["head"]
                 for distance, idx in zip(distance_row, index_row):
-                    full_result = self.metadata[idx] # Use scalar index
+                    full_result = metadata[idx] # Use scalar index
                     predicted_result = full_result[1] 
 
                     eval_result = predicted_result == target
@@ -676,7 +539,7 @@ class KBModel(pl.LightningModule):
             elif filtered_df.iloc[source_idx]["objective"] == 'predict_relation':
                 target = filtered_df.iloc[source_idx]["relation"]
                 for distance, idx in zip(distance_row, index_row):
-                    full_result = self.metadata[idx] # Use scalar index
+                    full_result = metadata[idx] # Use scalar index
                     predicted_result = full_result[3] 
                     # if eval_result:
                     #     print("true")
@@ -786,7 +649,7 @@ class KBModel(pl.LightningModule):
         elif mode == "train":
             dataset = self.train_dataset
 
-        ranks_dicts = self.compute_vector_search_mrr(dataset, batch)
+        ranks_dicts = self.compute_vector_search_mrr(dataset, self.metadata)
         #ranks_dicts = self.compute_model_mrr(batch, dataset, ranks_dicts)
 
         self.ranks_dicts = ranks_dicts
@@ -794,7 +657,7 @@ class KBModel(pl.LightningModule):
     
     def evaluate_all(self):
         dataset = self.test_dataset
-        self.compute_vector_search_mrr(dataset)
+        self.compute_vector_search_mrr(dataset, self.metadata)
         
 
     def generate(self, **kwargs):
