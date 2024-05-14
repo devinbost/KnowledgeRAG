@@ -378,7 +378,11 @@ HeadEntityID\tRelationID\tTailEntityID
         print("Starting test data prep.")
         self.build_entire_pipeline_real("test")
         print("Starting training data prep.")
-        #self.build_entire_wikidata_pipeline_real("train")
+        self.build_entire_pipeline_real("train")
+
+    def test_build_training_wikidata_split(self):
+        print("Starting training data prep.")
+        self.build_entire_pipeline_real("train")
 
     def build_graph_dfs_from_split(self, split: str):
         relation_df, entity_id_df, entity_name_df, entity_description_df, triple_id_df = self.read_wikidata5m_files(split)
@@ -393,7 +397,7 @@ HeadEntityID\tRelationID\tTailEntityID
         print("returning from build_graph_dfs_from_split(..)")
         return results_df, results_annotated_df
     def test_inspect_source_length_of_training_set(self):
-        results_df, results_annotated_df = self.build_graph_dfs_from_split("valid_tiny")
+        results_df, results_annotated_df = self.build_graph_dfs_from_split("train")
         # Calculate the length of each string in the 'source' column
         # Calculate the length of each string in the 'source' and 'target' columns
         print("Computing lengths")
@@ -539,7 +543,7 @@ HeadEntityID\tRelationID\tTailEntityID
         assert results_annotated_df.iloc[0]['tail_description'] == 'Startup that works with Company C. Similar to company F'
         assert results_annotated_df.iloc[0]['head_context'] == '<context>partners with (Company D), merged with (Company D)</context>'
         assert results_annotated_df.iloc[0]['tail_context'] == ''
-        assert results_annotated_df.iloc[0]['source'] == '<cls>predict head: Head: <head>. Relation: merged with. Tail: Company B<tail_description>Startup that works with Company C. Similar to company F</tail_description>'
+        assert results_annotated_df.iloc[0]['source'] == '<cls>predict head: head: <head> relation: merged with. tail: Company B<tail_description>Startup that works with Company C. Similar to company F</tail_description> context: <context>partners with (Company D), merged with (Company D)</context>'
         assert results_annotated_df.iloc[0]['target'] == '<head>Company A<end>'
         assert results_annotated_df.iloc[0]['objective'] == 'predict_head'
 
@@ -550,7 +554,7 @@ HeadEntityID\tRelationID\tTailEntityID
         assert results_annotated_df.iloc[1]['tail_description'] == 'Startup that works with Company C. Similar to company F'
         assert results_annotated_df.iloc[1]['head_context'] == '<context>partners with (Company D), merged with (Company D)</context>'
         assert results_annotated_df.iloc[1]['tail_context'] == ''
-        assert results_annotated_df.iloc[1]['source'] == '<cls>predict tail: Head: Company A<head_description>Tech firm</head_description>Relation: merged with. Tail: <tail>'
+        assert results_annotated_df.iloc[1]['source'] == '<cls>predict tail: head: Company A<head_description>Tech firm</head_description> context: <context>partners with (Company D), merged with (Company D)</context> relation: merged with. Tail: <tail>'
         assert results_annotated_df.iloc[1]['target'] == '<tail>Company B<end>'
         assert results_annotated_df.iloc[1]['objective'] == 'predict_tail'
 
@@ -561,7 +565,7 @@ HeadEntityID\tRelationID\tTailEntityID
         assert results_annotated_df.iloc[2]['tail_description'] == 'Startup that works with Company C. Similar to company F'
         assert results_annotated_df.iloc[2]['head_context'] == '<context>partners with (Company D), merged with (Company D)</context>'
         assert results_annotated_df.iloc[2]['tail_context'] == ''
-        assert results_annotated_df.iloc[2]['source'] == '<cls>predict relation: Head: Company A<head_description>Tech firm</head_description>Relation: <relation>. Tail: Company B<tail_description>Startup that works with Company C. Similar to company F</tail_description>'
+        assert results_annotated_df.iloc[2]['source'] == '<cls>predict relation: head: Company A<head_description>Tech firm</head_description> head context: <context>partners with (Company D), merged with (Company D)</context> relation: <relation> tail: Company B<tail_description>Startup that works with Company C. Similar to company F</tail_description> tail context: <context>{tail_context}</context>partners with (Company D), merged with (Company D)'
         assert results_annotated_df.iloc[2]['target'] == '<relation>merged with<end>'
         assert results_annotated_df.iloc[2]['objective'] == 'predict_relation'
 
@@ -577,20 +581,42 @@ HeadEntityID\tRelationID\tTailEntityID
         print("Built graph from pandas edge list. Adding node attributes next.")
         # Add node attributes for head entities
         # Prepare updates for head entities
-        head_updates = {
-            row['HeadEntityID']: {
-                'EntityName': row['EntityName_Head'],
-                'EntityDescription': row['EntityDescription_Head']
-            } for _, row in tqdm(dataframe.iterrows(), total=dataframe.shape[0], desc="Preparing head entities")
-        }
+        print("Preparing head entities")
+        head_updates = (
+            dataframe[['HeadEntityID', 'EntityName_Head', 'EntityDescription_Head']]
+            .rename(columns={
+                'EntityName_Head': 'EntityName',
+                'EntityDescription_Head': 'EntityDescription'
+            })
+            .set_index('HeadEntityID')
+            .apply(dict, axis=1)
+            .to_dict()
+        )
+        # head_updates = {
+        #     row['HeadEntityID']: {
+        #         'EntityName': row['EntityName_Head'],
+        #         'EntityDescription': row['EntityDescription_Head']
+        #     } for _, row in tqdm(dataframe.iterrows(), total=dataframe.shape[0], desc="Preparing head entities")
+        # }
 
         # Prepare updates for tail entities
-        tail_updates = {
-            row['TailEntityID']: {
-                'EntityName': row['EntityName_Tail'],
-                'EntityDescription': row['EntityDescription_Tail']
-            } for _, row in tqdm(dataframe.iterrows(), total=dataframe.shape[0], desc="Preparing tail entities")
-        }
+        print("Preparing tail entities")
+        tail_updates = (
+            dataframe[['TailEntityID', 'EntityName_Tail', 'EntityDescription_Tail']]
+            .rename(columns={
+                'EntityName_Tail': 'EntityName',
+                'EntityDescription_Tail': 'EntityDescription'
+            })
+            .set_index('TailEntityID')
+            .apply(dict, axis=1)
+            .to_dict()
+        )
+        # tail_updates = {
+        #     row['TailEntityID']: {
+        #         'EntityName': row['EntityName_Tail'],
+        #         'EntityDescription': row['EntityDescription_Tail']
+        #     } for _, row in tqdm(dataframe.iterrows(), total=dataframe.shape[0], desc="Preparing tail entities")
+        # }
 
         # Apply updates to the graph
         for node_id, attributes in tqdm(head_updates.items(), desc="Updating head nodes"):
@@ -663,7 +689,7 @@ HeadEntityID\tRelationID\tTailEntityID
                     })
 
                     results_annotated.append({
-                        'source': f"<cls>predict head: Head: <head>. Relation: {relation}. Tail: {tail_data['EntityName']}<tail_description>{tail_data['EntityDescription']}</tail_description>",
+                        'source': f"<cls>predict head: head: <head><sep>relation: {relation}<sep>tail: {tail_data['EntityName']}<sep>{tail_data['EntityDescription']}<sep>context: {tail_context}<sep>",
                         "target": f"<head>{head_data['EntityName']}<end>",
                         'head': head_data['EntityName'],
                         'head_description': head_data['EntityDescription'],
@@ -677,7 +703,7 @@ HeadEntityID\tRelationID\tTailEntityID
 
                     # Predict tail objective:
                     results_annotated.append({
-                        'source': f"<cls>predict tail: Head: {head_data['EntityName']}<head_description>{head_data['EntityDescription']}</head_description>Relation: {relation}. Tail: <tail>",
+                        'source': f"<cls>predict tail: head: {head_data['EntityName']}<sep>{head_data['EntityDescription']}<sep>context: {head_context}<sep>relation: {relation}<sep>tail: <tail><sep>",
                         "target": f"<tail>{tail_data['EntityName']}<end>",
                         'head': head_data['EntityName'],
                         'head_description': head_data['EntityDescription'],
@@ -692,7 +718,7 @@ HeadEntityID\tRelationID\tTailEntityID
                     # Predict relation objective:
 
                     results_annotated.append({
-                        'source': f"<cls>predict relation: Head: {head_data['EntityName']}<head_description>{head_data['EntityDescription']}</head_description>Relation: <relation>. Tail: {tail_data['EntityName']}<tail_description>{tail_data['EntityDescription']}</tail_description>",
+                        'source': f"<cls>predict relation: head: {head_data['EntityName']}<sep>{head_data['EntityDescription']}<sep>head context: {head_context}<sep>relation: <relation><sep>tail: {tail_data['EntityName']}<sep>{tail_data['EntityDescription']}<sep>tail context: {tail_context}<sep>",
                         "target": f"<relation>{relation}<end>",
                         'head': head_data['EntityName'],
                         'head_description': head_data['EntityDescription'],
