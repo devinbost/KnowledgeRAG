@@ -309,19 +309,12 @@ class KBModel(pl.LightningModule):
         #self.model = T5ForConditionalGeneration(config)
         self.model = T5ForConditionalGeneration.from_pretrained('t5-small')
         self.model.resize_token_embeddings(len(self.tokenizer))
-        self.efConstruction = 200
-        self.index_m = 32
-
-        self.faiss_index = faiss.IndexHNSWFlat(vector_length, self.index_m)
-        self.faiss_index.hnsw.efConstruction = self.efConstruction
 
         self.ranks_dicts = []
 
         self.num_predictions = 60 # This is something we may want to vary by config
         self.max_length = 512
         self.max_output_length = 40
-
-        self.metadata = []
 
         # Variables to track success score and total attempts for accuracy calculation
         self.address_success_score = 0
@@ -385,13 +378,10 @@ class KBModel(pl.LightningModule):
             pooled_embeddings = torch.mean(embeddings, dim=1)  # Pooling over the sequence dimension
         return pooled_embeddings.cpu().numpy()  # Convert tensor to numpy array
 
-    def write_to_faiss(self, batch_size=20):
+    def write_to_index(self, batch_size=20):
         with torch.no_grad():
-            # Need to clear the index.
-            self.faiss_index = faiss.IndexHNSWFlat(vector_length, self.index_m)
-            self.faiss_index.hnsw.efConstruction = self.efConstruction
-            self.metadata = []
-
+            metadata = []
+            embeddings_list = []
             # Goal is to get validation questions to beat embeddings from training data
             # Combine and deduplicate entries from all datasets
             combined_df = pd.concat([self.train_dataset.df, self.val_dataset.df, self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
@@ -420,14 +410,15 @@ class KBModel(pl.LightningModule):
                 
                 # Pool embeddings over the sequence dimension
                 mean_pooled_output = torch.mean(embeddings, dim=1).detach().cpu().numpy()  # Convert to numpy array for FAISS
-
-                self.faiss_index.add(mean_pooled_output)
+                embeddings_list.append(mean_pooled_output)
 
                 # Store metadata associated with embeddings
                 metadata_entries = batch_df.apply(lambda row: (row['objective'], row['head'], row['head_description'],
                                                             row['relation'], row['tail'], row['tail_description']), axis=1).tolist()
-                self.metadata.extend(metadata_entries)
-
+                metadata.extend(metadata_entries)
+            
+            all_embeddings = np.vstack(embeddings_list)
+            asyncio.run(self.indexing_strategy.index(all_embeddings, metadata))
             print("FAISS indexing complete and metadata stored.")
 
     
@@ -647,7 +638,7 @@ class KBModel(pl.LightningModule):
         self.log("test_loss", loss, prog_bar=True, logger=True)
 
         if not self.index_built:
-            self.write_to_faiss()
+            self.write_to_index()
             self.evaluate_all()
             self.index_built = True
 
