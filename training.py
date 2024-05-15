@@ -629,16 +629,6 @@ class KBModel(pl.LightningModule):
         print(f"Computed Hit Rates (Top-5): Tail: {hr5s['tail']}, Head: {hr5s['head']}, Relation: {hr5s['relation']}, All: {hr5s['all']}")
         print(f"Computed Hit Rates (Top-10): Tail: {hr10s['tail']}, Head: {hr10s['head']}, Relation: {hr10s['relation']}, All: {hr10s['all']}")
 
-    def clean_text(self, text):
-        # if text == "<tail>splash, water and dust resistant</tail>": # Used just for testing
-        #     return "splash, water, and dust resistant"
-        # Regex pattern to find anything between < and >
-        pattern = '<.*?>'
-        # Replace the matched text with an empty string
-        cleaned_text = re.sub(pattern, '', text)
-        stripped = cleaned_text.strip()
-        return stripped
-
     def evaluate(self, batch, mode='val'):
         ranks_dicts = []
 
@@ -717,9 +707,7 @@ def main():
                         logger=logger,
                         precision="16-mixed")
 
-    #trainer.fit(model, datamodule=data_module)
-    # model.write_to_faiss()
-    # model.evaluate_all()
+    trainer.fit(model, datamodule=data_module)
     trainer.test(model=model, datamodule=data_module)
 
 
