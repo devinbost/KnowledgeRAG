@@ -14,6 +14,10 @@ from langchain.prompts import PromptTemplate
 from torchmetrics.retrieval import RetrievalMRR
 from torchmetrics.retrieval import RetrievalNormalizedDCG
 from torchmetrics.retrieval import RetrievalHitRate
+from abc import ABC, abstractmethod
+from astrapy.db import AsyncAstraDB, AsyncAstraDBCollection
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 import faiss
 import os
 import random
@@ -27,7 +31,7 @@ random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
 # For debugging:
-torch.set_printoptions(profile="full")
+#torch.set_printoptions(profile="full")
 
 # If you are using CUDA (GPU), also set this for reproducibility
 torch.cuda.manual_seed(seed)
@@ -39,6 +43,7 @@ import sentencepiece
 print(sentencepiece.__version__)
 
 import pandas as pd
+from pandas import DataFrame
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-0125")
@@ -69,6 +74,141 @@ vector_length = 512
 
 from pydantic import BaseModel
 from typing import Optional, List
+
+class IndexingStrategy(ABC):
+    @abstractmethod
+    async def add(self, embeddings: np.ndarray, metadata: list) -> None:
+        pass
+
+    @abstractmethod
+    async def add_batch(self, batch) -> None:
+        pass
+
+    @abstractmethod
+    async def search(self, query_embedding: np.ndarray, limit: int) -> list:
+        pass
+
+    @abstractmethod
+    async def batch_search(self, source_df: DataFrame) -> list:
+        pass
+
+    @abstractmethod
+    async def clear(self):
+        """Deletes all contents of index."""
+        pass
+
+# Concrete Strategy for FAISS Indexing
+class FaissIndexing(IndexingStrategy):
+    def __init__(self, vector_length: int, index_m: int, efConstruction: int):
+        self.index = faiss.IndexHNSWFlat(vector_length, index_m)
+        self.index.hnsw.efConstruction = efConstruction
+        self.metadata = []
+        self.vector_length = vector_length
+        self.index_m = index_m
+        self.efConstruction = efConstruction
+
+    async def add(self, embeddings: np.ndarray, metadata: list) -> None:
+        self.index.add(embeddings)
+        self.metadata.extend(metadata)
+
+    async def add_batch(self, embeddings: np.ndarray, metadata: list) -> None:
+        print("Not implemented")
+
+    async def search(self, query_embedding: np.ndarray, limit: int) -> list:
+        distances, indices = self.index.search(query_embedding, limit)
+        batch_results = []
+        for distance_row, index_row in zip(distances, indices):
+            results = [(self.metadata[idx], dist) for idx, dist in zip(index_row, distance_row)]
+            batch_results.append(results[:limit])
+        return batch_results
+    
+    async def batch_search(self, source_df: DataFrame):
+        question_vectors = question_df["SourceVector"].tolist()
+        batch_vectors = np.stack(question_vectors)
+        batch_vectors = batch_vectors.squeeze() # This removes any singleton dimensions
+
+        distances, indices = self.index.search(batch_vectors, self.vector_length)
+        batch_results = []
+        for distance_row, index_row in zip(distances, indices):
+            results = [(self.metadata[idx], dist) for idx, dist in zip(index_row, distance_row)]
+            batch_results.append(results)
+        return distances, indices, batch_results
+
+    async def clear(self):
+        """Just reinitialize to clear."""
+        self.index = faiss.IndexHNSWFlat(self.vector_length, self.index_m)
+        self.index.hnsw.efConstruction = self.efConstruction
+        self.metadata = []
+
+# Concrete Strategy for AstraDB Indexing
+class AstraDBIndexing(IndexingStrategy):
+    def __init__(self, token: str, api_endpoint: str, collection_name: str, vector_length: int, default_limit: int):
+        self.astrapy_db = AsyncAstraDB(token=token, api_endpoint=api_endpoint)
+        self.collection_name = collection_name
+        self.vector_length = vector_length
+        self.default_limit = default_limit
+        self.collection = None
+
+    async def initialize_collection(self):
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        mycollections = await self.astrapy_db.get_collections()
+        if self.collection_name not in mycollections["status"]["collections"]:
+            self.collection = await self.astrapy_db.create_collection(collection_name=self.collection_name, dimension=self.vector_length)
+        else:
+            self.collection = AsyncAstraDBCollection(collection_name=self.collection_name, astra_db=self.astrapy_db)
+
+    async def add(self, embeddings: np.ndarray, metadata: list) -> None:
+        for embed, meta in tqdm(zip(embeddings, metadata), total=len(metadata)):
+            document = {"_id": meta[6]["Source"], "$vector": embed.tolist(), **meta[6]} # Caution: meta[6] currently is the dict, but be careful the contract doesn't change.
+            try:
+                await self.collection.insert_one(document)
+            except Exception as e:
+                print(f"Error: {e}")
+    
+    async def add_batch(self, batch) -> None:
+        if self.collection is None:
+            await self.initialize_collection()
+        try:
+            await self.collection.insert_many(batch, partial_failures_allowed=True)
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    async def search(self, query_embedding: np.ndarray, limit: int) -> list:
+        await self.initialize_collection()
+        result = await self.collection.vector_find(
+            vector=query_embedding.tolist(),
+            limit=limit
+        )
+        return result
+    
+    async def batch_search(self, source_df: DataFrame):
+        batch_results = []
+        for idx, source_row in source_df.iterrows():
+            results = await self.collection.vector_find(
+                vector=source_row["SourceVector"].squeeze().tolist(),
+                limit=self.default_limit
+            )
+            for result in results:
+                unique_idx = source_row["unique_index"]
+                similarity = result['$similarity']
+
+                if source_row["objective"] == "predict_tail":
+                    pred = source_row["tail"] == result["tail"]
+                    batch_results.append((unique_idx, similarity, pred, "predict_tail"))
+                elif source_row["objective"] == "predict_head":
+                    pred = source_row["head"] == result["head"]
+                    batch_results.append((unique_idx, similarity, pred, "predict_head"))
+                elif source_row["objective"] == "predict_relation":
+                    pred = source_row["relation"] == result["relation"]
+                    batch_results.append((unique_idx, similarity, pred, "predict_relation"))
+        return batch_results
+
+    async def clear(self):
+        await self.initialize_collection()
+        await self.collection.clear()
 
 class KBDataset(Dataset):
     def __init__(self, tokenizer, df, num_entities, max_length=vector_length):
@@ -298,7 +438,7 @@ class DataModuleWith_Tail_OneSep(pl.LightningDataModule):
 # embedding_model_test = SentenceTransformer('sentence-transformers/all-MiniLM-L12-v2')
 
 class KBModel(pl.LightningModule):
-    def __init__(self, data_module, special_tokens, learning_rate=0.001):
+    def __init__(self, data_module, special_tokens, indexing_strategy: IndexingStrategy, learning_rate=0.001):
         super().__init__()
         self.tokenizer = data_module.tokenizer
         self.train_dataset = data_module.train_dataset
@@ -309,6 +449,7 @@ class KBModel(pl.LightningModule):
         #self.model = T5ForConditionalGeneration(config)
         self.model = T5ForConditionalGeneration.from_pretrained('t5-small')
         self.model.resize_token_embeddings(len(self.tokenizer))
+        self.indexing_strategy = indexing_strategy
 
         self.ranks_dicts = []
 
@@ -316,11 +457,16 @@ class KBModel(pl.LightningModule):
         self.max_length = 512
         self.max_output_length = 40
 
+        self.metadata = []
+
         # Variables to track success score and total attempts for accuracy calculation
         self.address_success_score = 0
         self.address_total = 0
 
         self.index_built = False
+
+        # Create a dictionary to map unique strings to unique integer indices
+        self.unique_index_map = {}
         
     def forward(self, source_token_ids, attention_mask=None, target_token_ids=None):
         return self.model(input_ids=source_token_ids, attention_mask=attention_mask, labels=target_token_ids)
@@ -343,6 +489,7 @@ class KBModel(pl.LightningModule):
         return torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
 
     def get_scores(self, ids, scores):
+        """This method is only used when the model is in generative mode."""
         # ids has row count = self.num_predictions x batch_size
         # scores has tensor for each character. Each tensor is (self.num_predictions x batch_size) in rows, vocab_size in columns
         pad_token_id = self.tokenizer.pad_token_id
@@ -367,6 +514,11 @@ class KBModel(pl.LightningModule):
 
         return final_scores
 
+    def get_unique_index(self, string):
+        if string not in self.unique_index_map:
+            self.unique_index_map[string] = len(self.unique_index_map)
+        return self.unique_index_map[string]
+
     def prepare_query_vector(self, query_text):
         tokenized_query = self.tokenizer(query_text, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
         input_ids = tokenized_query['input_ids'].to('cuda')
@@ -378,19 +530,20 @@ class KBModel(pl.LightningModule):
             pooled_embeddings = torch.mean(embeddings, dim=1)  # Pooling over the sequence dimension
         return pooled_embeddings.cpu().numpy()  # Convert tensor to numpy array
 
-    def write_to_index(self, batch_size=20):
+    async def write_to_index(self, batch_size=20):
         with torch.no_grad():
-            metadata = []
-            embeddings_list = []
             # Goal is to get validation questions to beat embeddings from training data
             # Combine and deduplicate entries from all datasets
-            combined_df = pd.concat([self.train_dataset.df, self.val_dataset.df, self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
+            combined_df = pd.concat([self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
+            #combined_df = pd.concat([self.train_dataset.df, self.val_dataset.df, self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
             # Filter to only rows where 'objective' is 'predict_tail'
             #filtered_df = combined_df[combined_df['objective'] == "predict_tail"].reset_index(drop=True)
             filtered_df = combined_df
             
             # Calculate the number of batches
             num_batches = len(filtered_df) // batch_size + (0 if len(filtered_df) % batch_size == 0 else 1)
+
+            pair = []
 
             # Process each batch
             for batch_idx in range(num_batches):
@@ -410,19 +563,23 @@ class KBModel(pl.LightningModule):
                 
                 # Pool embeddings over the sequence dimension
                 mean_pooled_output = torch.mean(embeddings, dim=1).detach().cpu().numpy()  # Convert to numpy array for FAISS
-                embeddings_list.append(mean_pooled_output)
 
                 # Store metadata associated with embeddings
-                metadata_entries = batch_df.apply(lambda row: (row['objective'], row['head'], row['head_description'],
-                                                            row['relation'], row['tail'], row['tail_description']), axis=1).tolist()
-                metadata.extend(metadata_entries)
-            
-            all_embeddings = np.vstack(embeddings_list)
-            asyncio.run(self.indexing_strategy.index(all_embeddings, metadata))
-            print("FAISS indexing complete and metadata stored.")
+                metadata_entries = batch_df.apply(lambda row: {"_id": row['Source']+ "=>" + row["Target"], **row.to_dict()}, axis=1).tolist() 
 
-    
-    def compute_vector_search_mrr(self, dataset, metadata):
+                ready_to_write = []
+                for embed, meta in zip(mean_pooled_output.tolist(), metadata_entries):
+                    unique_id = meta["_id"]
+                    unique_index = self.get_unique_index(unique_id)
+                    meta["unique_index"] = unique_index
+                    new_obj = {"$vector": embed, **meta}
+                    ready_to_write.append(new_obj)
+                
+                await self.indexing_strategy.add_batch(ready_to_write)
+            
+            print("Indexing complete and metadata stored.")
+
+    async def compute_vector_search_mrr(self, dataset, metadata):
         # Index into vector search
 
         # Get top items randomly from DF
@@ -448,83 +605,63 @@ class KBModel(pl.LightningModule):
         all_indexes = []
 
         # Prepare data for vectorized operations
-        sources = filtered_df["Source"].tolist()
-        question_vectors = [self.prepare_query_vector(source) for source in sources]
+        #sources = filtered_df["Source"].tolist()
+        
+        filtered_df['SourceVector'] = filtered_df.apply(lambda row: self.prepare_query_vector(row['Source']), axis=1)
+
+        filtered_df['unique_index'] = filtered_df.apply(lambda row: self.get_unique_index(row['Source'] + "=>" + row['Target']), axis=1)
+
+        #question_vectors = [self.prepare_query_vector(source) for source in sources]
         # for vec in question_vectors:
         #     print(f"Individual vector shape: {vec.shape}")  # Check each vector's shape
-        batch_vectors = np.stack(question_vectors)
-        batch_vectors = batch_vectors.squeeze() # This removes any singleton dimensions
+        
+        all_result_list = await self.indexing_strategy.batch_search(filtered_df) # (unique_idx, similarity/pred, true/false, objective)
 
-        # print(f"Batch vectors shape: {batch_vectors.shape}")  # Final shape check before FAISS search
-        # Search in FAISS in batch
-        distances, indices = self.faiss_index.search(batch_vectors, vector_length)
+        tail_list = [r for r in all_result_list if r[3] == "predict_tail"]
+        head_list = [r for r in all_result_list if r[3] == "predict_head"]
+        relation_list = [r for r in all_result_list if r[3] == "predict_relation"]
 
-        for source_idx, (distance_row, index_row) in enumerate(zip(distances, indices)):
-            if filtered_df.iloc[source_idx]["objective"] == 'predict_tail':
-                target = filtered_df.iloc[source_idx]["tail"]
-                for distance, idx in zip(distance_row, index_row):
-                    full_result = metadata[idx] # Use scalar index
-                    predicted_result = full_result[4]  
+        # Unpack and convert to lists
+        all_unique_idx_list, all_similarity_list, all_true_false_list, all_objective_list = zip(*all_result_list)
+        all_unique_idx_list = list(all_unique_idx_list)
+        all_similarity_list = list(all_similarity_list)
+        all_true_false_list = list(all_true_false_list)
 
-                    eval_result = predicted_result == target
-                    # if eval_result:
-                    #     print("true")
-                    tail_targets.append(eval_result)
-                    tail_results.append(1-distance) # Must be passed as similarities to ensure they're sorted correctly.
-                    tail_indexes.append(source_idx)
+        # Convert to tensors
+        all_indexes_tensor = torch.tensor(all_unique_idx_list, dtype=torch.int64)
+        all_preds_tensor = torch.tensor(all_similarity_list)
+        all_targets_tensor = torch.tensor(all_true_false_list)
 
-                    all_targets.append(eval_result)
-                    all_results.append(1-distance)
-                    all_indexes.append(source_idx)
-            elif filtered_df.iloc[source_idx]["objective"] == 'predict_head':
-                target = filtered_df.iloc[source_idx]["head"]
-                for distance, idx in zip(distance_row, index_row):
-                    full_result = metadata[idx] # Use scalar index
-                    predicted_result = full_result[1] 
+        # Unpack and convert tail_list
+        tail_unique_idx_list, tail_similarity_list, tail_true_false_list, tail_objective_list = zip(*tail_list)
+        tail_unique_idx_list = list(tail_unique_idx_list)
+        tail_similarity_list = list(tail_similarity_list)
+        tail_true_false_list = list(tail_true_false_list)
 
-                    eval_result = predicted_result == target
-                    # if eval_result:
-                    #     print("true")
-                    head_targets.append(eval_result)
-                    head_results.append(1-distance)
-                    head_indexes.append(source_idx)
+        tail_indexes_tensor = torch.tensor(tail_unique_idx_list, dtype=torch.int64)
+        tail_preds_tensor = torch.tensor(tail_similarity_list)
+        tail_targets_tensor = torch.tensor(tail_true_false_list)
 
-                    all_targets.append(eval_result)
-                    all_results.append(1-distance)
-                    all_indexes.append(source_idx)
+        # Unpack and convert head_list
+        head_unique_idx_list, head_similarity_list, head_true_false_list, head_objective_list = zip(*head_list)
+        head_unique_idx_list = list(head_unique_idx_list)
+        head_similarity_list = list(head_similarity_list)
+        head_true_false_list = list(head_true_false_list)
 
-            elif filtered_df.iloc[source_idx]["objective"] == 'predict_relation':
-                target = filtered_df.iloc[source_idx]["relation"]
-                for distance, idx in zip(distance_row, index_row):
-                    full_result = metadata[idx] # Use scalar index
-                    predicted_result = full_result[3] 
-                    # if eval_result:
-                    #     print("true")
+        head_indexes_tensor = torch.tensor(head_unique_idx_list, dtype=torch.int64)
+        head_preds_tensor = torch.tensor(head_similarity_list)
+        head_targets_tensor = torch.tensor(head_true_false_list)
 
-                    eval_result = predicted_result == target
-                    relation_targets.append(eval_result)
-                    relation_results.append(1-distance)
-                    relation_indexes.append(source_idx)
+        # Unpack and convert relation_list
+        relation_unique_idx_list, relation_similarity_list, relation_true_false_list, relation_objective_list = zip(*relation_list)
+        relation_unique_idx_list = list(relation_unique_idx_list)
+        relation_similarity_list = list(relation_similarity_list)
+        relation_true_false_list = list(relation_true_false_list)
 
-                    all_targets.append(eval_result)
-                    all_results.append(1-distance)
-                    all_indexes.append(source_idx)
-            
-        tail_targets_tensor = torch.tensor(tail_targets)
-        tail_preds_tensor = torch.tensor(tail_results)
-        tail_indexes_tensor = torch.tensor(tail_indexes, dtype=torch.int64)
-
-        head_targets_tensor = torch.tensor(head_targets)
-        head_preds_tensor = torch.tensor(head_results)
-        head_indexes_tensor = torch.tensor(head_indexes, dtype=torch.int64)
-
-        relation_targets_tensor = torch.tensor(relation_targets)
-        relation_preds_tensor = torch.tensor(relation_results)
-        relation_indexes_tensor = torch.tensor(relation_indexes, dtype=torch.int64)
-
-        all_targets_tensor = torch.tensor(all_targets)
-        all_preds_tensor = torch.tensor(all_results)
-        all_indexes_tensor = torch.tensor(all_indexes, dtype=torch.int64)
+        relation_indexes_tensor = torch.tensor(relation_unique_idx_list, dtype=torch.int64)
+        relation_preds_tensor = torch.tensor(relation_similarity_list)
+        relation_targets_tensor = torch.tensor(relation_true_false_list)
+        
 
         def compute_and_log(metric_name, metric_func, preds_tensors, target_tensors, index_tensors, log_func):
             metrics = {}
@@ -586,7 +723,7 @@ class KBModel(pl.LightningModule):
         print(f"Computed Hit Rates (Top-5): Tail: {hr5s['tail']}, Head: {hr5s['head']}, Relation: {hr5s['relation']}, All: {hr5s['all']}")
         print(f"Computed Hit Rates (Top-10): Tail: {hr10s['tail']}, Head: {hr10s['head']}, Relation: {hr10s['relation']}, All: {hr10s['all']}")
 
-    def evaluate(self, batch, mode='val'):
+    async def evaluate(self, batch, mode='val'):
         ranks_dicts = []
 
         if mode == "val":
@@ -596,15 +733,15 @@ class KBModel(pl.LightningModule):
         elif mode == "train":
             dataset = self.train_dataset
 
-        ranks_dicts = self.compute_vector_search_mrr(dataset, self.metadata)
+        ranks_dicts = await self.compute_vector_search_mrr(dataset, self.metadata)
         #ranks_dicts = self.compute_model_mrr(batch, dataset, ranks_dicts)
 
         self.ranks_dicts = ranks_dicts
         return ranks_dicts
     
-    def evaluate_all(self):
+    async def evaluate_all(self):
         dataset = self.test_dataset
-        self.compute_vector_search_mrr(dataset, self.metadata)
+        await self.compute_vector_search_mrr(dataset, self.metadata)
         
 
     def generate(self, **kwargs):
@@ -637,12 +774,17 @@ class KBModel(pl.LightningModule):
         loss = outputs.loss
         self.log("test_loss", loss, prog_bar=True, logger=True)
 
-        if not self.index_built:
-            self.write_to_index()
-            self.evaluate_all()
-            self.index_built = True
+        asyncio.run(self.index_and_evaluate())
 
         return loss
+
+    async def index_and_evaluate(self):
+        if not self.index_built:
+            await self.indexing_strategy.clear()
+            await self.write_to_index()
+            await self.evaluate_all()
+            self.index_built = True
+
 
 def main():
     # Used at eval
@@ -650,8 +792,19 @@ def main():
     tokenizer.add_tokens(special_tokens)  
     data_module = DataModuleWith_Tail_OneSep(tokenizer, batch_size=batch_size)
     data_module.setup()
+
+    faiss_indexing_strategy = FaissIndexing(vector_length=vector_length, index_m=32, efConstruction=200)
+    astradb_indexing_strategy = AstraDBIndexing(
+        token=os.getenv("ASTRA_TOKEN"), 
+        api_endpoint=os.getenv("ASTRA_API_ENDPOINT"), 
+        collection_name=os.getenv("ASTRA_COLLECTION"), 
+        vector_length=vector_length, 
+        default_limit=10
+    )
     #model = KBModel(data_module=data_module, special_tokens=special_tokens)
-    model = KBModel.load_from_checkpoint("/teamspace/jobs/t5-knowledge-graph-pretrain-v3-predict-all-torchmetrics-2/nodes.0/kg_logs_v4/knowledge_tuples_T5_knowledge_graph_pretrain_v3_predict_all_torchmetrics/version_1/checkpoints/epoch=0-step=1940.ckpt", data_module=data_module, special_tokens=special_tokens)
+
+    model = KBModel.load_from_checkpoint("/teamspace/jobs/t5-knowledge-graph-pretrain-v3-predict-all-torchmetrics-2/nodes.0/kg_logs_v4/knowledge_tuples_T5_knowledge_graph_pretrain_v3_predict_all_torchmetrics/version_1/checkpoints/epoch=0-step=1940.ckpt", 
+        data_module=data_module, special_tokens=special_tokens, indexing_strategy=astradb_indexing_strategy)
     from lightning.pytorch.loggers import TensorBoardLogger
     logger = TensorBoardLogger("kg_logs_v4", name=filename + "_" + suffix)
 
@@ -664,7 +817,9 @@ def main():
                         logger=logger,
                         precision="16-mixed")
 
-    trainer.fit(model, datamodule=data_module)
+    #trainer.fit(model, datamodule=data_module)
+    # model.write_to_index()
+    # model.evaluate_all()
     trainer.test(model=model, datamodule=data_module)
 
 
