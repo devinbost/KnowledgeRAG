@@ -70,13 +70,6 @@ vector_length = 512
 from pydantic import BaseModel
 from typing import Optional, List
 
-class Part(BaseModel):
-    text: str
-    position: int
-    token: str
-    bucket: Optional[str] = None
-    swapped: bool
-
 class KBDataset(Dataset):
     def __init__(self, tokenizer, df, num_entities, max_length=vector_length):
         self.tokenizer = tokenizer
@@ -266,33 +259,6 @@ class DataModuleWith_Tail_OneSep(pl.LightningDataModule):
             self.val_dataset = KBDataset(self.tokenizer, val_df, num_val_entities, self.max_length)
             self.test_dataset = KBDataset(self.tokenizer, test_df, num_test_entities, self.max_length)
             self.first_run = False
-
-    def sample_parts(self, word_parts: List[Part], percentage: float) -> List[Part]:
-        """
-        Filter a list of Part objects to only a specified percentage.
-
-        Parameters:
-        - parts (List[Part]): The list of Part objects to filter.
-        - percentage (float): The percentage of the list to keep.
-
-        Returns:
-        - List[Part]: A list containing the specified percentage of Part objects.
-        """
-        total_count = len(word_parts)
-        # Calculate how many parts to select
-        selected_count = int(np.ceil(total_count * (percentage / 100)))
-
-        if selected_count < 1:
-            # If selected_count is 0, return an empty list or handle as needed
-            return []
-
-        # Randomly select indices without replacement
-        selected_indices = np.random.choice(total_count, size=selected_count, replace=False)
-
-        # Create a new list with the selected elements
-        selected_parts = [word_parts[i] for i in selected_indices]
-
-        return selected_parts
 
     def prepare_dataset(self, df):
         mem_head = df.apply(lambda x: pd.Series({"Source": f"<cls>predict head: Head: <head><sep>Relation: {x['relation']}<sep>Tail: {x['tail']}<sep>{x['tail_description']}<sep>",
