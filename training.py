@@ -17,6 +17,7 @@ from torchmetrics.retrieval import RetrievalHitRate
 from abc import ABC, abstractmethod
 from astrapy.db import AsyncAstraDB, AsyncAstraDBCollection
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, List
 import asyncio
 import faiss
 import os
@@ -31,7 +32,7 @@ random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
 # For debugging:
-#torch.set_printoptions(profile="full")
+torch.set_printoptions(profile="full")
 
 # If you are using CUDA (GPU), also set this for reproducibility
 torch.cuda.manual_seed(seed)
@@ -81,7 +82,7 @@ class IndexingStrategy(ABC):
         pass
 
     @abstractmethod
-    async def add_batch(self, batch) -> None:
+    async def add_batch(self, embeddings_of_batch, dataframe_of_batch) -> None:
         pass
 
     @abstractmethod
@@ -98,7 +99,7 @@ class IndexingStrategy(ABC):
         pass
 
 # Concrete Strategy for FAISS Indexing
-class FaissIndexing(IndexingStrategy):
+class FaissIndexing:
     def __init__(self, vector_length: int, index_m: int, efConstruction: int):
         self.index = faiss.IndexHNSWFlat(vector_length, index_m)
         self.index.hnsw.efConstruction = efConstruction
@@ -106,39 +107,126 @@ class FaissIndexing(IndexingStrategy):
         self.vector_length = vector_length
         self.index_m = index_m
         self.efConstruction = efConstruction
+        self.prediction_id_map = {}
+        self.added_ids = set()
 
-    async def add(self, embeddings: np.ndarray, metadata: list) -> None:
+    async def add_all(self, full_dataframe):
+        with torch.no_grad():
+            filtered_df = full_dataframe
+            
+            # Calculate the number of batches
+            num_batches = len(filtered_df) // batch_size + (0 if len(filtered_df) % batch_size == 0 else 1)
+
+            pair = []
+
+            # Process each batch
+            for batch_idx in range(num_batches):
+                # Slice the DataFrame to get the batch
+                start_idx = batch_idx * batch_size
+                end_idx = start_idx + batch_size
+                batch_df = filtered_df.iloc[start_idx:end_idx]
+
+                await self.add_batch(batch_df)
+
+    # async def add_batch(self, embeddings_of_batch, dataframe_of_batch) -> None:
+    #     metadata_entries = dataframe_of_batch.apply(lambda row: {"_id": row['prediction_id'], **row.to_dict()}, axis=1).tolist() 
+
+    #     ready_to_write = []
+    #     for embed, meta in zip(embeddings_of_batch, metadata_entries):
+    #         unique_id = meta["_id"]
+    #         prediction_id = self.get_prediction_id(unique_id)
+    #         meta["prediction_id"] = prediction_id
+    #         new_obj = {"$vector": embed, **meta}
+    #         ready_to_write.append(new_obj)
+        
+    #     await self.indexing_strategy.write_batch(ready_to_write)
+    async def add_batch(self, dataframe_of_batch: DataFrame) -> None:
+        metadata_entries = dataframe_of_batch.apply(
+            lambda row: {"_id": row['prediction_id'], **row.to_dict()}, axis=1).tolist()
+        
+        unique_embeddings = []
+        unique_metadata = []
+
+        for row in metadata_entries:
+            unique_id = row["_id"]
+            if unique_id not in self.added_ids:
+                self.added_ids.add(unique_id)
+                unique_embeddings.append(row["SourceVector"])
+                unique_metadata.append({**row})
+            else:
+                print("Found duplicate for row: " + row["Source"])
+        
+        if unique_embeddings:
+            unique_embeddings = np.array(unique_embeddings)
+            await self.add(unique_embeddings, unique_metadata)
+    
+    async def add(self, embeddings: np.ndarray, metadata: List[dict]) -> None:
+        embeddings = embeddings.squeeze() # Removing singleton dimension
         self.index.add(embeddings)
         self.metadata.extend(metadata)
 
-    async def add_batch(self, embeddings: np.ndarray, metadata: list) -> None:
-        print("Not implemented")
-
-    async def search(self, query_embedding: np.ndarray, limit: int) -> list:
+    async def search(self, query_embedding: np.ndarray, limit: int) -> List[List[Any]]:
         distances, indices = self.index.search(query_embedding, limit)
         batch_results = []
         for distance_row, index_row in zip(distances, indices):
             results = [(self.metadata[idx], dist) for idx, dist in zip(index_row, distance_row)]
             batch_results.append(results[:limit])
         return batch_results
-    
-    async def batch_search(self, source_df: DataFrame):
-        question_vectors = question_df["SourceVector"].tolist()
-        batch_vectors = np.stack(question_vectors)
-        batch_vectors = batch_vectors.squeeze() # This removes any singleton dimensions
+
+    async def batch_search(self, source_df: DataFrame) -> List[tuple]:
+        question_vectors = source_df["SourceVector"].tolist()
+        batch_vectors = np.vstack(question_vectors)
 
         distances, indices = self.index.search(batch_vectors, self.vector_length)
         batch_results = []
-        for distance_row, index_row in zip(distances, indices):
+
+        for idx, (distance_row, index_row) in enumerate(zip(distances, indices)):
+            source_row = source_df.iloc[idx]
             results = [(self.metadata[idx], dist) for idx, dist in zip(index_row, distance_row)]
-            batch_results.append(results)
-        return distances, indices, batch_results
+            results_sorted = sorted(results, key=lambda x: x[1])  # Sort by distance
+            
+            if source_row["objective"] == "predict_tail":
+                tails = [(source_row["head"], source_row["relation"], res[0]['tail'], res[0]['tail_description']) for res in results_sorted]
+                distinct_tails = list({(head, relation, tail, tail_description) for head, relation, tail, tail_description in tails})
+                top10tails = distinct_tails[:10]
+                print(top10tails)
+
+            if source_row["objective"] == "predict_relation":
+                relations = [(source_row['head'], res[0]['relation'], source_row['tail']) for res in results_sorted]
+                distinct_relations = list({(head, relation, tail) for head, relation, tail in relations})
+                top10relations = distinct_relations[:10]
+                print(top10relations)
+
+            for result in results_sorted:
+                unique_idx = source_row["prediction_id"]
+                similarity = 1 / (1 + result[1])  # Convert distance to similarity
+
+                if source_row["objective"] == "predict_tail":
+                    pred = source_row["tail"] == result[0]["tail"]
+                    if pred:
+                        print(source_row["Source"])
+                    batch_results.append((unique_idx, similarity, pred, "predict_tail"))
+                elif source_row["objective"] == "predict_head":
+                    pred = source_row["head"] == result[0]["head"]
+                    batch_results.append((unique_idx, similarity, pred, "predict_head"))
+                elif source_row["objective"] == "predict_relation":
+                    pred = source_row["relation"] == result[0]["relation"]
+                    batch_results.append((unique_idx, similarity, pred, "predict_relation"))
+
+        return batch_results
 
     async def clear(self):
         """Just reinitialize to clear."""
         self.index = faiss.IndexHNSWFlat(self.vector_length, self.index_m)
         self.index.hnsw.efConstruction = self.efConstruction
         self.metadata = []
+        self.added_ids.clear()
+        self.prediction_id_map = {}
+
+    def get_prediction_id(self, string: str) -> int:
+        if string not in self.prediction_id_map:
+            self.prediction_id_map[string] = len(self.prediction_id_map)
+        return self.prediction_id_map[string]
 
 # Concrete Strategy for AstraDB Indexing
 class AstraDBIndexing(IndexingStrategy):
@@ -148,6 +236,7 @@ class AstraDBIndexing(IndexingStrategy):
         self.vector_length = vector_length
         self.default_limit = default_limit
         self.collection = None
+        self.prediction_id_map = {}
 
     async def initialize_collection(self):
         loop = asyncio.get_event_loop()
@@ -160,6 +249,46 @@ class AstraDBIndexing(IndexingStrategy):
         else:
             self.collection = AsyncAstraDBCollection(collection_name=self.collection_name, astra_db=self.astrapy_db)
 
+    async def add_all(self, full_dataframe: DataFrame):
+        with torch.no_grad():
+            filtered_df = full_dataframe
+            
+            # Calculate the number of batches
+            num_batches = len(filtered_df) // batch_size + (0 if len(filtered_df) % batch_size == 0 else 1)
+
+            pair = []
+
+            # Process each batch
+            for batch_idx in range(num_batches):
+                # Slice the DataFrame to get the batch
+                start_idx = batch_idx * batch_size
+                end_idx = start_idx + batch_size
+                batch_df = filtered_df.iloc[start_idx:end_idx]
+
+                await self.add_batch(batch_df)
+    
+    async def add_batch(self, dataframe_of_batch) -> None:
+        ready_to_write = []
+        
+        for index, row in dataframe_of_batch.iterrows():
+            if isinstance(row["SourceVector"], np.ndarray):
+                row["SourceVector"] = row["SourceVector"].squeeze().tolist()
+            unique_id = row['prediction_id']
+            prediction_id = self.get_prediction_id(unique_id)
+            row["prediction_id"] = prediction_id
+            new_obj = {"$vector": row["SourceVector"], "_id": unique_id, **row}
+            ready_to_write.append(new_obj)
+        
+        await self.write_batch(ready_to_write)
+
+    async def write_batch(self, batch) -> None:
+        if self.collection is None:
+            await self.initialize_collection()
+        try:
+            await self.collection.insert_many(batch, partial_failures_allowed=True)
+        except Exception as e:
+            print(f"Error: {e}")
+    
     async def add(self, embeddings: np.ndarray, metadata: list) -> None:
         for embed, meta in tqdm(zip(embeddings, metadata), total=len(metadata)):
             document = {"_id": meta[6]["Source"], "$vector": embed.tolist(), **meta[6]} # Caution: meta[6] currently is the dict, but be careful the contract doesn't change.
@@ -167,14 +296,6 @@ class AstraDBIndexing(IndexingStrategy):
                 await self.collection.insert_one(document)
             except Exception as e:
                 print(f"Error: {e}")
-    
-    async def add_batch(self, batch) -> None:
-        if self.collection is None:
-            await self.initialize_collection()
-        try:
-            await self.collection.insert_many(batch, partial_failures_allowed=True)
-        except Exception as e:
-            print(f"Error: {e}")
     
     async def search(self, query_embedding: np.ndarray, limit: int) -> list:
         await self.initialize_collection()
@@ -191,12 +312,33 @@ class AstraDBIndexing(IndexingStrategy):
                 vector=source_row["SourceVector"].squeeze().tolist(),
                 limit=self.default_limit
             )
+            # Commented block below is just for debugging/evaluation:
+            # Sort the results by $similarity in descending order
+            # results_sorted = sorted(results, key=lambda x: x['$similarity'], reverse=True)
+            #  # Extract "tail" and "tail_description" when "objective" == "predict_tail"
+            # if source_row["objective"] == "predict_tail":
+            #     src = source_row["Source"]
+            #     tails = [(source_row["head"], source_row["relation"], res['tail'], res['tail_description']) for res in results_sorted]
+            #     distinct_tails = list({(head, relation, tail, tail_description) for head, relation, tail, tail_description in tails})
+            #     top10tails = distinct_tails[:10]
+            #     print(top10tails)
+
+            # if source_row["objective"] == "predict_relation":
+            #     # Extract "head" and "tail" when "objective" == "predict_relation"
+            #     src = source_row["Source"]
+            #     relations = [(source_row['head'], res['relation'], source_row['tail']) for res in results_sorted]
+            #     distinct_relations = list({(head, relation, tail) for head, relation, tail in relations})
+            #     top10relations = distinct_relations[:10]
+            #     print(top10relations)
+
             for result in results:
-                unique_idx = source_row["unique_index"]
+                unique_idx = source_row["prediction_id"]
                 similarity = result['$similarity']
 
                 if source_row["objective"] == "predict_tail":
                     pred = source_row["tail"] == result["tail"]
+                    if pred == True:
+                        print(source_row["Source"])
                     batch_results.append((unique_idx, similarity, pred, "predict_tail"))
                 elif source_row["objective"] == "predict_head":
                     pred = source_row["head"] == result["head"]
@@ -209,6 +351,11 @@ class AstraDBIndexing(IndexingStrategy):
     async def clear(self):
         await self.initialize_collection()
         await self.collection.clear()
+
+    def get_prediction_id(self, string):
+        if string not in self.prediction_id_map:
+            self.prediction_id_map[string] = len(self.prediction_id_map)
+        return self.prediction_id_map[string]
 
 class KBDataset(Dataset):
     def __init__(self, tokenizer, df, num_entities, max_length=vector_length):
@@ -466,7 +613,7 @@ class KBModel(pl.LightningModule):
         self.index_built = False
 
         # Create a dictionary to map unique strings to unique integer indices
-        self.unique_index_map = {}
+        self.prediction_id_map = {}
         
     def forward(self, source_token_ids, attention_mask=None, target_token_ids=None):
         return self.model(input_ids=source_token_ids, attention_mask=attention_mask, labels=target_token_ids)
@@ -514,11 +661,6 @@ class KBModel(pl.LightningModule):
 
         return final_scores
 
-    def get_unique_index(self, string):
-        if string not in self.unique_index_map:
-            self.unique_index_map[string] = len(self.unique_index_map)
-        return self.unique_index_map[string]
-
     def prepare_query_vector(self, query_text):
         tokenized_query = self.tokenizer(query_text, return_tensors='pt', padding=True, truncation=True, max_length=self.max_length).to('cuda')
         input_ids = tokenized_query['input_ids'].to('cuda')
@@ -535,7 +677,7 @@ class KBModel(pl.LightningModule):
             # Goal is to get validation questions to beat embeddings from training data
             # Combine and deduplicate entries from all datasets
             combined_df = pd.concat([self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
-            #combined_df = pd.concat([self.train_dataset.df, self.val_dataset.df, self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
+            #combined_df = pd.concat([self.test_dataset.df]).drop_duplicates().reset_index(drop=True)
             # Filter to only rows where 'objective' is 'predict_tail'
             #filtered_df = combined_df[combined_df['objective'] == "predict_tail"].reset_index(drop=True)
             filtered_df = combined_df
@@ -564,18 +706,7 @@ class KBModel(pl.LightningModule):
                 # Pool embeddings over the sequence dimension
                 mean_pooled_output = torch.mean(embeddings, dim=1).detach().cpu().numpy()  # Convert to numpy array for FAISS
 
-                # Store metadata associated with embeddings
-                metadata_entries = batch_df.apply(lambda row: {"_id": row['Source']+ "=>" + row["Target"], **row.to_dict()}, axis=1).tolist() 
-
-                ready_to_write = []
-                for embed, meta in zip(mean_pooled_output.tolist(), metadata_entries):
-                    unique_id = meta["_id"]
-                    unique_index = self.get_unique_index(unique_id)
-                    meta["unique_index"] = unique_index
-                    new_obj = {"$vector": embed, **meta}
-                    ready_to_write.append(new_obj)
-                
-                await self.indexing_strategy.add_batch(ready_to_write)
+                await self.indexing_strategy.add_batch(mean_pooled_output, batch_df)
             
             print("Indexing complete and metadata stored.")
 
@@ -609,8 +740,12 @@ class KBModel(pl.LightningModule):
         
         filtered_df['SourceVector'] = filtered_df.apply(lambda row: self.prepare_query_vector(row['Source']), axis=1)
 
-        filtered_df['unique_index'] = filtered_df.apply(lambda row: self.get_unique_index(row['Source'] + "=>" + row['Target']), axis=1)
+        filtered_df['prediction_id'] = filtered_df.apply(lambda row: self.indexing_strategy.get_prediction_id(f"{row['Source']}|{row['Target']}|{row['head']}|{row['head_description']}|{row['relation']}|{row['tail']}|{row['tail_description']}"), axis=1)
+        
+        duplicate_rows = filtered_df[filtered_df.duplicated(subset='prediction_id', keep=False)]
+        assert duplicate_rows.shape[0] == 0
 
+        await self.indexing_strategy.add_all(filtered_df)
         #question_vectors = [self.prepare_query_vector(source) for source in sources]
         # for vec in question_vectors:
         #     print(f"Individual vector shape: {vec.shape}")  # Check each vector's shape
@@ -781,7 +916,7 @@ class KBModel(pl.LightningModule):
     async def index_and_evaluate(self):
         if not self.index_built:
             await self.indexing_strategy.clear()
-            await self.write_to_index()
+            #await self.write_to_index()
             await self.evaluate_all()
             self.index_built = True
 
@@ -804,7 +939,7 @@ def main():
     #model = KBModel(data_module=data_module, special_tokens=special_tokens)
 
     model = KBModel.load_from_checkpoint("/teamspace/jobs/t5-knowledge-graph-pretrain-v3-predict-all-torchmetrics-2/nodes.0/kg_logs_v4/knowledge_tuples_T5_knowledge_graph_pretrain_v3_predict_all_torchmetrics/version_1/checkpoints/epoch=0-step=1940.ckpt", 
-        data_module=data_module, special_tokens=special_tokens, indexing_strategy=astradb_indexing_strategy)
+        data_module=data_module, special_tokens=special_tokens, indexing_strategy=faiss_indexing_strategy)
     from lightning.pytorch.loggers import TensorBoardLogger
     logger = TensorBoardLogger("kg_logs_v4", name=filename + "_" + suffix)
 
