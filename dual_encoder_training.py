@@ -31,6 +31,7 @@ import sentencepiece
 print(sentencepiece.__version__)
 
 import lightning as pl
+import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 
@@ -44,7 +45,7 @@ torch.manual_seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)  # For multi-GPU setups
-batch_size = 12
+batch_size = 16
 
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
@@ -52,7 +53,7 @@ model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-012
 
 # Run from terminal: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 
-filename = "coarse_dual_T5"
+filename = "coarse_dual_T5_CL_neg_lr5_batch16_temp02_margin1"
 suffix = "baseline"
 dataset_prefix = f"AmexPairs_{suffix}"
 # Used at eval
@@ -411,15 +412,6 @@ class ContrastiveSentencePairDataset(Dataset):
             "label": label
         }
 
-def collate_fn(batch):
-    input_ids1 = torch.cat([item[0]['input_ids'] for item in batch])
-    attention_mask1 = torch.cat([item[0]['attention_mask'] for item in batch])
-    input_ids2 = torch.cat([item[1]['input_ids'] for item in batch])
-    attention_mask2 = torch.cat([item[1]['attention_mask'] for item in batch])
-    labels = torch.stack([item[2] for item in batch])
-    return {'input_ids1': input_ids1, 'attention_mask1': attention_mask1, 'input_ids2': input_ids2, 'attention_mask2': attention_mask2, 'labels': labels}
-
-
 class ContrastiveDataModule(pl.LightningDataModule):
     def __init__(self, data_path, tokenizer_name='t5-base', batch_size=16, max_length=1024, random_state=42, match_behavior = "omit", train_size=0.98, val_size=0.01, test_size=0.01):
         super().__init__()
@@ -588,8 +580,25 @@ class ContrastiveDataModule(pl.LightningDataModule):
         print(f"Test DataLoader batch size: {self.batch_size}")
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=7)
 
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin=1.0, temperature=0.1):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+        self.temperature = temperature
+
+    def forward(self, z1, z2, labels):
+        distances = F.pairwise_distance(z1, z2)
+        distances = distances / self.temperature  # Apply temperature scaling
+
+        # Positive and negative pairs
+        pos_pair_loss = labels * torch.pow(distances, 2)
+        neg_pair_loss = (1 - labels) * torch.pow(torch.clamp(self.margin - distances, min=0.0), 2)
+
+        loss = torch.mean(pos_pair_loss + neg_pair_loss)
+        return loss
+
 class DualEncoderT5Contrastive(pl.LightningModule):
-    def __init__(self, data_module: ContrastiveDataModule, model_name: str, indexing_strategy: IndexingStrategy, learning_rate=1e-3, temperature=0.05):
+    def __init__(self, data_module: ContrastiveDataModule, model_name: str, indexing_strategy: IndexingStrategy, learning_rate=1e-3, temperature=0.2, margin=1.0):
         # super(DualEncoderT5Contrastive, self).__init__()
         super().__init__()
         self.data_module = data_module
@@ -607,6 +616,8 @@ class DualEncoderT5Contrastive(pl.LightningModule):
 
         self.indexing_strategy = indexing_strategy
 
+        self.loss_fn = ContrastiveLoss(margin, temperature)
+
     def mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output.last_hidden_state
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
@@ -614,10 +625,10 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
         return sum_embeddings / sum_mask
 
-    def contrastive_loss(self, z1, z2, labels):
-        logits = torch.matmul(z1, z2.T) / self.temperature
-        labels = torch.arange(z1.size(0), device=self.device)
-        return F.cross_entropy(logits, labels)
+    # def contrastive_loss(self, z1, z2, labels):
+    #     logits = torch.matmul(z1, z2.T) / self.temperature
+    #     labels = torch.arange(z1.size(0), device=self.device)
+    #     return F.cross_entropy(logits, labels)
 
     def forward(self, chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask):
         encoder1_outputs = self.encoder1(input_ids=chunk1_ids, attention_mask=chunk1_attention_mask)
@@ -639,7 +650,7 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         
         labels = batch['label']
         z1, z2 = self.forward(chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask)
-        loss = self.contrastive_loss(z1, z2, labels)
+        loss = self.loss_fn(z1, z2, labels)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -848,9 +859,9 @@ def main():
         batch_size=16, 
         max_length=1024, 
         match_behavior = "neg",
-        train_size=0.98, 
-        val_size=0.0, 
-        test_size=0.02)
+        train_size=0.90, 
+        val_size=0.05, 
+        test_size=0.05)
     data_module.setup()
     faiss_indexing_strategy = FaissIndexing(vector_length=vector_length, index_m=32, efConstruction=200)
     # astradb_indexing_strategy = AstraDBIndexing(
@@ -864,8 +875,9 @@ def main():
     model = DualEncoderT5Contrastive(data_module=data_module, 
         model_name='t5-small',
         indexing_strategy=faiss_indexing_strategy, 
-        learning_rate=1e-3, 
-        temperature=0.05)
+        learning_rate=1e-5, 
+        temperature=0.2,
+        margin=1.0)
     # Initialize trainer
 
     from lightning.pytorch.loggers import TensorBoardLogger
@@ -881,7 +893,7 @@ def main():
     
 
     # Train the model
-    #trainer.fit(model, datamodule=data_module)
+    trainer.fit(model, datamodule=data_module)
     trainer.test(model=model, datamodule=data_module)
 
 
