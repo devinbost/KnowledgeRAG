@@ -206,6 +206,11 @@ class FaissIndexing(IndexingStrategy):
             results = [(self.metadata[idx], dist) for idx, dist in zip(index_row, distance_row)]
             results_sorted = sorted(results, key=lambda x: x[1])  # Sort by distance
             unique_idx = source_row["prediction_id"]
+            # if source_row["objective"] == "predict_tail":
+            #     tails = [(source_row["head"], source_row["relation"], res[0]['tail'], res[0]['tail_description']) for res in results_sorted]
+            #     distinct_tails = list({(head, relation, tail, tail_description) for head, relation, tail, tail_description in tails})
+            #top10tails = results_sorted[:10]
+            #print(top10tails)
 
             for result in results_sorted:
 
@@ -757,7 +762,12 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         mrr10 = RetrievalMRR(top_k=10)
 
         ndcg = RetrievalNormalizedDCG()
+        ndcg1 = RetrievalNormalizedDCG(top_k=1)
+        ndcg3 = RetrievalNormalizedDCG(top_k=3)
+        ndcg5 = RetrievalNormalizedDCG(top_k=5)
+        ndcg10 = RetrievalNormalizedDCG(top_k=10)
 
+        hr = RetrievalHitRate()
         hr1 = RetrievalHitRate(top_k=1)
         hr3 = RetrievalHitRate(top_k=3)
         hr5 = RetrievalHitRate(top_k=5)
@@ -778,8 +788,13 @@ class DualEncoderT5Contrastive(pl.LightningModule):
 
         # Calculate and log the NDCGs
         ndcgs = compute_and_log("ndcg", ndcg, result_tensors, target_tensors, index_tensors, self.log)
+        ndcg1s = compute_and_log("ndcg01", ndcg1, result_tensors, target_tensors, index_tensors, self.log)
+        ndcg3s = compute_and_log("ndcg03", ndcg3, result_tensors, target_tensors, index_tensors, self.log)
+        ndcg5s = compute_and_log("ndcg05", ndcg5, result_tensors, target_tensors, index_tensors, self.log)
+        ndcg10s = compute_and_log("ndcg10", ndcg10, result_tensors, target_tensors, index_tensors, self.log)
 
         # Calculate and log the Hit Rates
+        hr = compute_and_log("hr", hr, result_tensors, target_tensors, index_tensors, self.log)
         hr1s = compute_and_log("hr01", hr1, result_tensors, target_tensors, index_tensors, self.log)
         hr3s = compute_and_log("hr03", hr3, result_tensors, target_tensors, index_tensors, self.log)
         hr5s = compute_and_log("hr05", hr5, result_tensors, target_tensors, index_tensors, self.log)
@@ -787,17 +802,22 @@ class DualEncoderT5Contrastive(pl.LightningModule):
 
         # Print the results
         print(f"Computed MRRs: All: {mrrs['all']}")
-        print(f"Computed MRRs (Top-1): All: {mrr1s['all']}")
-        print(f"Computed MRRs (Top-3): All: {mrr3s['all']}")
-        print(f"Computed MRRs (Top-5): All: {mrr5s['all']}")
-        print(f"Computed MRRs (Top-10): All: {mrr10s['all']}")
+        print(f"Computed MRRs (Top-1): {mrr1s['all']}")
+        print(f"Computed MRRs (Top-3): {mrr3s['all']}")
+        print(f"Computed MRRs (Top-5): {mrr5s['all']}")
+        print(f"Computed MRRs (Top-10): {mrr10s['all']}")
 
         print(f"Computed NDCGs: All: {ndcgs['all']}")
+        print(f"Computed NDCGs: (Top-1): {ndcg1s['all']}")
+        print(f"Computed NDCGs: (Top-3): {ndcg3s['all']}")
+        print(f"Computed NDCGs: (Top-5): {ndcg5s['all']}")
+        print(f"Computed NDCGs: (Top-10): {ndcg10s['all']}")
 
-        print(f"Computed Hit Rates (Top-1): All: {hr1s['all']}")
-        print(f"Computed Hit Rates (Top-3): All: {hr3s['all']}")
-        print(f"Computed Hit Rates (Top-5): All: {hr5s['all']}")
-        print(f"Computed Hit Rates (Top-10): All: {hr10s['all']}")
+        print(f"Computed Hit Rates: All: {hr['all']}")
+        print(f"Computed Hit Rates (Top-1): {hr1s['all']}")
+        print(f"Computed Hit Rates (Top-3): {hr3s['all']}")
+        print(f"Computed Hit Rates (Top-5): {hr5s['all']}")
+        print(f"Computed Hit Rates (Top-10): {hr10s['all']}")
 
     async def evaluate(self, batch, mode='val'):
         ranks_dicts = []
