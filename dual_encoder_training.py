@@ -10,7 +10,7 @@ from langchain.chat_models import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda, Runnable
 from langchain.prompts import PromptTemplate
-from torchmetrics.retrieval import RetrievalMRR, RetrievalNormalizedDCG, RetrievalHitRate
+from torchmetrics.retrieval import RetrievalMRR, RetrievalNormalizedDCG, RetrievalHitRate, RetrievalMAP, RetrievalAUROC
 from typing import Any, List, Optional
 import faiss
 import os
@@ -53,8 +53,8 @@ model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-012
 
 # Run from terminal: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 
-filename = "coarse_dual_T5_CL_neg_lr5_batch16_temp02_margin1"
-suffix = "baseline"
+filename = "coarse_dual_T5_CL_pos_lr5_batch16_temp02_margin1_auroc"
+suffix = "small"
 dataset_prefix = f"AmexPairs_{suffix}"
 # Used at eval
 
@@ -235,6 +235,8 @@ class FaissIndexing(IndexingStrategy):
         self.metadata = []
         self.added_ids.clear()
         self.prediction_id_map = {}
+        self.added_chunks = set()
+        self.result_map = {}
 
     def get_prediction_id(self, string: str) -> int:
         if string not in self.prediction_id_map:
@@ -376,8 +378,11 @@ class ContrastiveSentencePairDataset(Dataset):
             (row['chunk1'], row['chunk2']) for idx, row in df.iterrows()
         ]
         self.labels = [
-            1 if row['result'] != 'NONE' else 0 for idx, row in df.iterrows()
+            1 if row['result'] != 'NONE' and row['result'] is not None else 0 for idx, row in df.iterrows()
         ]
+        # self.labels = [
+        #     0 if row['result'] is None or row['result'] == 'NONE' else 1 for idx, row in df.iterrows()
+        # ]
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.df = df
@@ -462,7 +467,7 @@ class ContrastiveDataModule(pl.LightningDataModule):
         # Group by chunk1 and chunk2 and apply the condition to filter out any extra rows (ensuring the remaining one is not "NONE") 
         def filter_results(group):
             # Check if there are any results that are not "NONE"
-            non_none = group[group['result'] != 'NONE']
+            non_none = group[(group['result'] != 'NONE') & (group['result'].notna())]
             if not non_none.empty:
                 # If there are, return the first one
                 return non_none.iloc[0]
@@ -497,6 +502,11 @@ class ContrastiveDataModule(pl.LightningDataModule):
         # train_df = df[df.apply(lambda row: row['head'] in self.train_entities, axis=1)].reset_index(drop=True)
         # val_df = df[df.apply(lambda row: row['head'] in self.val_entities, axis=1)].reset_index(drop=True)
         # test_df = df[df.apply(lambda row: row['head'] in self.test_entities, axis=1)].reset_index(drop=True)
+
+        # # For training with contrastive loss, we must ensure that all training rows are positive examples so we don't end up with zero positives in any batch
+        # train_df = train_df[(train_df['result'] != 'NONE') & (train_df['result'].notna())].reset_index(drop=True)
+        # val_df = val_df[(val_df['result'] != 'NONE') & (val_df['result'].notna())].reset_index(drop=True)
+        # test_df = test_df[(test_df['result'] != 'NONE') & (test_df['result'].notna())].reset_index(drop=True)
 
 
         print(f"Row count of train_df is: {train_df.shape[0]}")
@@ -580,21 +590,44 @@ class ContrastiveDataModule(pl.LightningDataModule):
         print(f"Test DataLoader batch size: {self.batch_size}")
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=7)
 
-class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=1.0, temperature=0.1):
-        super(ContrastiveLoss, self).__init__()
-        self.margin = margin
+class InfoNCELoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super(InfoNCELoss, self).__init__()
         self.temperature = temperature
 
-    def forward(self, z1, z2, labels):
-        distances = F.pairwise_distance(z1, z2)
-        distances = distances / self.temperature  # Apply temperature scaling
+    def forward(self, chunk1_embedding, positive, negatives):
+        # Positive is the chunk2_embedding where label == 1 for the given chunk1
+        # Negatives are the other chunk2_embedding values, as long as they don't have the same chunk1 AND label == 1
 
-        # Positive and negative pairs
-        pos_pair_loss = labels * torch.pow(distances, 2)
-        neg_pair_loss = (1 - labels) * torch.pow(torch.clamp(self.margin - distances, min=0.0), 2)
+        # Ensure query and positive are 2D
+        if chunk1_embedding.dim() == 1:
+            chunk1_embedding = chunk1_embedding.unsqueeze(0)
+        if positive.dim() == 1:
+            positive = positive.unsqueeze(0)
 
-        loss = torch.mean(pos_pair_loss + neg_pair_loss)
+        if negatives.dim() == 2:
+            negatives = negatives.unsqueeze(0)
+
+        print(f"positive shape: {positive.shape}")    # Should be (batch_size, embedding_dim)
+        print(f"negatives shape: {negatives.shape}")  # Should be (batch_size, num_negatives, embedding_dim)
+        
+        print(f"chunk1_embedding shape: {chunk1_embedding.shape}")          # Should be (batch_size, embedding_dim)
+        # Compute similarities
+        pos_sim = torch.sum(chunk1_embedding * positive, dim=-1) / self.temperature
+        neg_sim = torch.matmul(chunk1_embedding, negatives.transpose(1, 2)) / self.temperature
+
+        
+        print(f"pos_sim shape: {pos_sim.shape}")  # Should be (batch_size,)
+        print(f"neg_sim shape: {neg_sim.shape}")  # Should be (batch_size, num_negatives)
+
+        # Concatenate positive and negative similarities
+        logits = torch.cat((pos_sim.unsqueeze(1), neg_sim.squeeze(1)), dim=1)
+
+        # Create labels (first position is positive example)
+        labels = torch.zeros(chunk1_embedding.size(0), dtype=torch.long, device=chunk1_embedding.device)
+
+        loss = F.cross_entropy(logits, labels)
+        
         return loss
 
 class DualEncoderT5Contrastive(pl.LightningModule):
@@ -612,11 +645,9 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         self.learning_rate = learning_rate
         self.temperature = temperature
 
-        self.index_built = False
-
         self.indexing_strategy = indexing_strategy
 
-        self.loss_fn = ContrastiveLoss(margin, temperature)
+        self.loss_fn = InfoNCELoss(temperature)
 
     def mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output.last_hidden_state
@@ -649,32 +680,74 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         chunk2_attention_mask = batch["chunk2_attention_mask"]
         
         labels = batch['label']
-        z1, z2 = self.forward(chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask)
-        loss = self.loss_fn(z1, z2, labels)
+        chunk1_embedding_norm, chunk2_embedding_norm = self.forward(chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask)
+        
+        # Find the first positive row
+        positive_indices = torch.where(labels == 1)[0]
+        if len(positive_indices) == 0:
+            # Skip the batch if there are no positive examples
+            return None
+
+        positive_index = positive_indices[0] # Get first positive case.
+        positive_chunk1_ids = chunk1_ids[positive_index]
+    
+        negative_indices = (labels == 0) | (
+            (labels == 1) & (chunk1_ids != positive_chunk1_ids.unsqueeze(0)).any(dim=1)
+        )
+
+        positive_chunk1_embedding = chunk1_embedding_norm[positive_index]
+        positive_chunk2_embedding = chunk2_embedding_norm[positive_index]
+        
+        #negatives_chunk1_embedding = chunk1_embedding_norm[negative_indices]
+        negatives_chunk2_embedding = chunk2_embedding_norm[negative_indices]
+
+        # Combine chunk1 and chunk2 negatives
+       # negatives = torch.cat([negatives_chunk1_embedding, negatives_chunk2_embedding], dim=0)
+        
+        if len(negatives_chunk2_embedding) == 0:
+            # Skip the batch if there are no negative examples
+            return None
+
+        # Compute InfoNCE loss
+        loss = self.loss_fn(positive_chunk1_embedding, positive_chunk2_embedding, negatives_chunk2_embedding)
+
         return loss
 
     def training_step(self, batch, batch_idx):
         loss = self.compute_step(batch, batch_idx)
+        if loss is None:
+            return None
         self.log('train_loss', loss, prog_bar=True, logger=True, batch_size=len(batch))
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss = self.compute_step(batch, batch_idx)
+        if loss is None:
+            return None
         self.log('val_loss', loss, prog_bar=True, logger=True, batch_size=len(batch))
         return loss
+    
+    def on_validation_epoch_end(self):
+        asyncio.run(self.index_and_evaluate_val())
 
     def test_step(self, batch, batch_idx):
         loss = self.compute_step(batch, batch_idx)
+        if loss is None:
+            return None
         self.log('test_loss', loss, prog_bar=True, logger=True, batch_size=len(batch))
-        asyncio.run(self.index_and_evaluate())
         return loss
+    
+    def on_test_epoch_end(self):
+        asyncio.run(self.index_and_evaluate_test())
 
-    async def index_and_evaluate(self):
-        if not self.index_built:
-            await self.indexing_strategy.clear()
-            #await self.write_to_index()
-            await self.evaluate_all()
-            self.index_built = True
+    async def index_and_evaluate_test(self):
+        await self.indexing_strategy.clear()
+        await self.evaluate_all_test()
+
+    async def index_and_evaluate_val(self):
+        await self.indexing_strategy.clear()
+        await self.evaluate_all_val()
+    
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.learning_rate)
         return optimizer
@@ -735,8 +808,14 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         #question_vectors = [self.prepare_query_vector(source) for source in sources]
         # for vec in question_vectors:
         #     print(f"Individual vector shape: {vec.shape}")  # Check each vector's shape
+         
+        if self.data_module.match_behavior == "pos":
+            # In this case, to see useful results, we need to omit the self-matches from the evaluation.
+            filtered_df = filtered_df[filtered_df['chunk1_id'] != filtered_df['chunk2_id']].reset_index(drop=True)
         
         all_result_list = await self.indexing_strategy.batch_search(filtered_df) # (unique_idx, similarity/pred, true/false, objective)
+
+        
 
         # tail_list = [r for r in all_result_list if r[3] == "predict_tail"]
         # head_list = [r for r in all_result_list if r[3] == "predict_head"]
@@ -784,6 +863,19 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         hr5 = RetrievalHitRate(top_k=5)
         hr10 = RetrievalHitRate(top_k=10)
 
+        # Initialize metric functions
+        maps = RetrievalMAP()
+        map1 = RetrievalMAP(top_k=1)
+        map3 = RetrievalMAP(top_k=3)
+        map5 = RetrievalMAP(top_k=5)
+        map10 = RetrievalMAP(top_k=10)
+
+        aurocs = RetrievalAUROC()
+        auroc1 = RetrievalAUROC(top_k=1)
+        auroc3 = RetrievalAUROC(top_k=3)
+        auroc5 = RetrievalAUROC(top_k=5)
+        auroc10 = RetrievalAUROC(top_k=10)
+
         # Add other tensors to lists if more exist for the use case:
         result_tensors = [all_preds_tensor]
         target_tensors = [all_targets_tensor]
@@ -791,7 +883,6 @@ class DualEncoderT5Contrastive(pl.LightningModule):
 
         # Calculate and log the MRRs
         mrrs = compute_and_log("mrr", mrr, result_tensors, target_tensors, index_tensors, self.log)
-
         mrr1s = compute_and_log("mrr01", mrr1, result_tensors, target_tensors, index_tensors, self.log)
         mrr3s = compute_and_log("mrr03", mrr3, result_tensors, target_tensors, index_tensors, self.log)
         mrr5s = compute_and_log("mrr05", mrr5, result_tensors, target_tensors, index_tensors, self.log)
@@ -810,6 +901,20 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         hr3s = compute_and_log("hr03", hr3, result_tensors, target_tensors, index_tensors, self.log)
         hr5s = compute_and_log("hr05", hr5, result_tensors, target_tensors, index_tensors, self.log)
         hr10s = compute_and_log("hr10", hr10, result_tensors, target_tensors, index_tensors, self.log)
+
+        # Calculate and log the MAPs
+        maps = compute_and_log("maps", maps, result_tensors, target_tensors, index_tensors, self.log)
+        map1s = compute_and_log("map01", map1, result_tensors, target_tensors, index_tensors, self.log)
+        map3s = compute_and_log("map03", map3, result_tensors, target_tensors, index_tensors, self.log)
+        map5s = compute_and_log("map05", map5, result_tensors, target_tensors, index_tensors, self.log)
+        map10s = compute_and_log("map10", map10, result_tensors, target_tensors, index_tensors, self.log)
+
+        # Calculate and log the AUROCs
+        aurocs = compute_and_log("aurocs", aurocs, result_tensors, target_tensors, index_tensors, self.log)
+        auroc1s = compute_and_log("auroc01", auroc1, result_tensors, target_tensors, index_tensors, self.log)
+        auroc3s = compute_and_log("auroc03", auroc3, result_tensors, target_tensors, index_tensors, self.log)
+        auroc5s = compute_and_log("auroc05", auroc5, result_tensors, target_tensors, index_tensors, self.log)
+        auroc10s = compute_and_log("auroc10", auroc10, result_tensors, target_tensors, index_tensors, self.log)
 
         # Print the results
         print(f"Computed MRRs: All: {mrrs['all']}")
@@ -830,38 +935,60 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         print(f"Computed Hit Rates (Top-5): {hr5s['all']}")
         print(f"Computed Hit Rates (Top-10): {hr10s['all']}")
 
-    async def evaluate(self, batch, mode='val'):
-        ranks_dicts = []
+        print(f"Computed MAPs: All: {maps['all']}")
+        print(f"Computed MAPs (Top-1): {map1s['all']}")
+        print(f"Computed MAPs (Top-3): {map3s['all']}")
+        print(f"Computed MAPs (Top-5): {map5s['all']}")
+        print(f"Computed MAPs (Top-10): {map10s['all']}")
 
-        if mode == "val":
-            dataset = self.val_dataset
-        elif mode == "test":
-            dataset = self.test_dataset
-        elif mode == "train":
-            dataset = self.train_dataset
+        print(f"Computed AUROCs: All: {aurocs['all']}")
+        print(f"Computed AUROCs (Top-1): {auroc1s['all']}")
+        print(f"Computed AUROCs (Top-3): {auroc3s['all']}")
+        print(f"Computed AUROCs (Top-5): {auroc5s['all']}")
+        print(f"Computed AUROCs (Top-10): {auroc10s['all']}")
 
-        ranks_dicts = await self.compute_vector_search_mrr(dataset)
+    # async def evaluate(self, batch, mode='val'):
+    #     ranks_dicts = []
+
+    #     if mode == "val":
+    #         dataset = self.val_dataset
+    #     elif mode == "test":
+    #         dataset = self.test_dataset
+    #     elif mode == "train":
+    #         dataset = self.train_dataset
+
+    #     ranks_dicts = await self.compute_vector_search_mrr(dataset)
         #ranks_dicts = self.compute_model_mrr(batch, dataset, ranks_dicts)
 
-        self.ranks_dicts = ranks_dicts
-        return ranks_dicts
+        #self.ranks_dicts = ranks_dicts
     
-    async def evaluate_all(self):
+    async def evaluate_all_test(self):
         dataset = self.test_dataset
+        await self.compute_vector_search_mrr(dataset)
+
+    async def evaluate_all_val(self):
+        dataset = self.val_dataset
         await self.compute_vector_search_mrr(dataset)
 
 
 def main():
    
     # Initialize
-    data_module = ContrastiveDataModule(data_path=data_path, 
+    #data_module = ContrastiveDataModule.,
+    data_module = ContrastiveDataModule(
+        data_path=data_path, 
         tokenizer_name='t5-small', 
-        batch_size=16, 
+        batch_size=20, 
         max_length=1024, 
-        match_behavior = "neg",
-        train_size=0.90, 
-        val_size=0.05, 
-        test_size=0.05)
+        match_behavior = "pos",
+        train_size=0.80, 
+        val_size=0.10, 
+        test_size=0.10)
+
+        # train_size=0.90, 
+        # val_size=0.05, 
+        # test_size=0.05)
+
     data_module.setup()
     faiss_indexing_strategy = FaissIndexing(vector_length=vector_length, index_m=32, efConstruction=200)
     # astradb_indexing_strategy = AstraDBIndexing(
@@ -872,7 +999,9 @@ def main():
     #     default_limit=10
     # )
 
-    model = DualEncoderT5Contrastive(data_module=data_module, 
+    #model = DualEncoderT5Contrastive.load_from_checkpoint("/teamspace/jobs/coarse-dual-t5-cl-pos-lr5-batch16-temp02-margin1-amexpairs-baseline/nodes.0/coarse_dual_T5_CL_pos_lr5_batch16_temp02_margin1/AmexPairs_baseline___coarse_dual_T5_CL_pos_lr5_batch16_temp02_margin1__baseline/version_0/checkpoints/epoch=0-step=1473.ckpt",
+    model = DualEncoderT5Contrastive(
+        data_module=data_module, 
         model_name='t5-small',
         indexing_strategy=faiss_indexing_strategy, 
         learning_rate=1e-5, 
@@ -885,8 +1014,8 @@ def main():
 
     trainer = pl.Trainer(max_epochs=50, accelerator="gpu", devices=-1,
                         enable_progress_bar=True,
-                        callbacks=[ModelCheckpoint(monitor="val_loss"),
-                                    EarlyStopping(monitor="val_loss", patience=3)],
+                        callbacks=[ModelCheckpoint(monitor="ndcg10_predict_all"),
+                                    EarlyStopping(monitor="ndcg10_predict_all", patience=3)],
                         logger=logger,
                         precision="16-mixed")
 
