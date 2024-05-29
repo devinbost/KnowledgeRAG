@@ -53,7 +53,7 @@ model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-012
 
 # Run from terminal: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 
-filename = "coarse_dual_T5_InfoNCE_omit_lr3_batch20_ndcg10_baseline"
+filename = "coarse_dual_T5_InfoNCE_temp05_omit_lr3_batch20_ndcg10_baseline"
 suffix = "baseline"
 dataset_prefix = f"AmexPairs_{suffix}"
 # Used at eval
@@ -67,7 +67,6 @@ torch.set_float32_matmul_precision("medium")
 
 vector_length = 512
 max_length = 1024
-
 
 class IndexingStrategy(ABC):
     @abstractmethod
@@ -603,21 +602,34 @@ class ContrastiveDataModule(pl.LightningDataModule):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=7)
 
 class InfoNCELoss(nn.Module):
-    def __init__(self, device, temperature=0.1):
+    def __init__(self, temperature=0.1):
         super(InfoNCELoss, self).__init__()
         self.temperature = temperature
-        self.device = device
 
     def forward(self, chunk1_embedding_norm, chunk2_embedding_norm):
+        device = chunk1_embedding_norm.device
         chunk2_embedding_norm_transpose = chunk2_embedding_norm.transpose(0,1)
-        similarity_matrix = torch.matmul(chunk1_embedding_norm, chunk2_embedding_norm_transpose)
+        similarity_matrix = torch.matmul(chunk1_embedding_norm, chunk2_embedding_norm_transpose) / self.temperature
         # I could implement temperature by dividing the similarity_matrix by it?
 
-        positive_indices = torch.arange(chunk1_embedding_norm.shape[0]).to(self.device)
+        positive_indices = torch.arange(chunk1_embedding_norm.shape[0], device=device)
 
         loss = F.cross_entropy(similarity_matrix, positive_indices)
         
         return loss
+
+# class ProjectionHead(nn.Module):
+#     def __init__(self, input_dim):
+#         super(ProjectionHead, self).__init__()
+#         self.fc1 = nn.Linear(input_dim, input_dim // 2)
+#         self.relu = nn.ReLU()
+#         self.fc2 = nn.Linear(input_dim // 2, input_dim / 4)
+    
+#     def forward(self, x):
+#         x = self.fc1(x)
+#         x = self.relu(x)
+#         x = self.fc2(x)
+#         return x
 
 class DualEncoderT5Contrastive(pl.LightningModule):
     def __init__(self, data_module: ContrastiveDataModule, model_name: str, indexing_strategy: IndexingStrategy, learning_rate=1e-3, temperature=0.2, margin=1.0):
@@ -633,10 +645,11 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         self.encoder2 = T5EncoderModel.from_pretrained(model_name)
         self.learning_rate = learning_rate
         self.temperature = temperature
+        #self.projection_head = ProjectionHead(vector_length)
 
         self.indexing_strategy = indexing_strategy
 
-        self.loss_fn = InfoNCELoss(self.device, temperature)
+        self.loss_fn = InfoNCELoss(temperature)
 
     def mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output.last_hidden_state
@@ -656,6 +669,9 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         
         pooled_output1 = self.mean_pooling(encoder1_outputs, chunk1_attention_mask)
         pooled_output2 = self.mean_pooling(encoder2_outputs, chunk2_attention_mask)
+
+        # projected_output1 = self.projection_head(pooled_output1)
+        # projected_output2 = self.projection_head(pooled_output2)
         
         normalized_output1 = F.normalize(pooled_output1, p=2, dim=1)
         normalized_output2 = F.normalize(pooled_output2, p=2, dim=1)
@@ -670,17 +686,17 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         
         chunk1_embedding_norm, chunk2_embedding_norm = self.forward(chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask)
         
-        ######### Need to separate this into the InfoNCE class:
-        chunk2_embedding_norm_transpose = chunk2_embedding_norm.transpose(0,1)
-        similarity_matrix = torch.matmul(chunk1_embedding_norm, chunk2_embedding_norm_transpose)
-        # I could implement temperature by dividing the similarity_matrix by it?
+        # ######### Need to separate this into the InfoNCE class:
+        # chunk2_embedding_norm_transpose = chunk2_embedding_norm.transpose(0,1)
+        # similarity_matrix = torch.matmul(chunk1_embedding_norm, chunk2_embedding_norm_transpose) / self.temperature
+        # # I could implement temperature by dividing the similarity_matrix by it?
 
-        positive_indices = torch.arange(chunk1_embedding_norm.shape[0]).to(self.device)
+        # positive_indices = torch.arange(chunk1_embedding_norm.shape[0]).to(self.device)
 
-        loss = F.cross_entropy(similarity_matrix, positive_indices)
-        #########
+        # loss = F.cross_entropy(similarity_matrix, positive_indices)
+        # #########
         
-        #loss = self.loss_fn(chunk1_embedding_norm, chunk2_embedding_norm)
+        loss = self.loss_fn(chunk1_embedding_norm, chunk2_embedding_norm)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -996,7 +1012,7 @@ def main():
     
 
     # Train the model
-    #trainer.fit(model, datamodule=data_module)
+    trainer.fit(model, datamodule=data_module)
     trainer.test(model=model, datamodule=data_module)
 
 
