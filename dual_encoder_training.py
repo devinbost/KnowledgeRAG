@@ -53,8 +53,8 @@ model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-012
 
 # Run from terminal: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 
-filename = "coarse_dual_T5_CL_pos_lr5_batch16_temp02_margin1_auroc"
-suffix = "small"
+filename = "coarse_dual_T5_InfoNCE_omit_lr3_batch20_ndcg10_baseline"
+suffix = "baseline"
 dataset_prefix = f"AmexPairs_{suffix}"
 # Used at eval
 
@@ -508,6 +508,12 @@ class ContrastiveDataModule(pl.LightningDataModule):
         # val_df = val_df[(val_df['result'] != 'NONE') & (val_df['result'].notna())].reset_index(drop=True)
         # test_df = test_df[(test_df['result'] != 'NONE') & (test_df['result'].notna())].reset_index(drop=True)
 
+        val_ann_df = val_df
+        test_ann_df = test_df
+        
+        train_df = train_df[(train_df['result'] != 'NONE') & (train_df['result'].notna())].reset_index(drop=True)
+        val_df = val_df[(val_df['result'] != 'NONE') & (val_df['result'].notna())].reset_index(drop=True)
+        test_df = test_df[(test_df['result'] != 'NONE') & (test_df['result'].notna())].reset_index(drop=True)
 
         print(f"Row count of train_df is: {train_df.shape[0]}")
         print(f"Row count of val_df is: {val_df.shape[0]}")
@@ -520,7 +526,7 @@ class ContrastiveDataModule(pl.LightningDataModule):
         # print("Test:")
         # print(test_df[['head','head_description','relation','tail', 'tail_description']].head())
 
-        return train_df, val_df, test_df
+        return train_df, val_df, test_df, val_ann_df, test_ann_df
 
     def setup(self, stage=None):
         if self.first_run:
@@ -530,6 +536,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 train_df = pd.read_parquet(self.train_file)
                 val_df = pd.read_parquet(self.val_file)
                 test_df = pd.read_parquet(self.test_file)
+                val_ann_df = pd.read_parquet(self.val_file + ".ann")
+                test_ann_df = pd.read_parquet(self.test_file + ".ann")
                 with open(self.entities_count_file, 'r') as f:
                     entities_count = json.load(f)
                 num_train_entities = entities_count['num_train_entities']
@@ -543,7 +551,7 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 # filtered_df = self.apply_description_filter(df)
 
                 # Split the full dataframe into training, validation, and test sets
-                train_df, val_df, test_df = self.create_strict_splits(df, 
+                train_df, val_df, test_df, val_ann_df, test_ann_df = self.create_strict_splits(df, 
                     train_size=self.train_size, 
                     val_size=self.val_size, 
                     test_size=self.test_size)
@@ -556,6 +564,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 train_df.to_parquet(self.train_file)
                 val_df.to_parquet(self.val_file)
                 test_df.to_parquet(self.test_file)
+                val_ann_df.to_parquet(self.val_file + ".ann")
+                test_ann_df.to_parquet(self.test_file + ".ann")
 
                 num_train_entities = len(self.train_entities)
                 num_val_entities = len(self.val_entities)
@@ -576,6 +586,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
             self.val_dataset = ContrastiveSentencePairDataset(val_df, self.tokenizer, self.max_length)
             self.test_dataset = ContrastiveSentencePairDataset(test_df, self.tokenizer, self.max_length)
             self.first_run = False
+            self.val_ann_df = val_ann_df
+            self.test_ann_df = test_ann_df
 
     
     def train_dataloader(self):
@@ -591,42 +603,19 @@ class ContrastiveDataModule(pl.LightningDataModule):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=7)
 
 class InfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.1):
+    def __init__(self, device, temperature=0.1):
         super(InfoNCELoss, self).__init__()
         self.temperature = temperature
+        self.device = device
 
-    def forward(self, chunk1_embedding, positive, negatives):
-        # Positive is the chunk2_embedding where label == 1 for the given chunk1
-        # Negatives are the other chunk2_embedding values, as long as they don't have the same chunk1 AND label == 1
+    def forward(self, chunk1_embedding_norm, chunk2_embedding_norm):
+        chunk2_embedding_norm_transpose = chunk2_embedding_norm.transpose(0,1)
+        similarity_matrix = torch.matmul(chunk1_embedding_norm, chunk2_embedding_norm_transpose)
+        # I could implement temperature by dividing the similarity_matrix by it?
 
-        # Ensure query and positive are 2D
-        if chunk1_embedding.dim() == 1:
-            chunk1_embedding = chunk1_embedding.unsqueeze(0)
-        if positive.dim() == 1:
-            positive = positive.unsqueeze(0)
+        positive_indices = torch.arange(chunk1_embedding_norm.shape[0]).to(self.device)
 
-        if negatives.dim() == 2:
-            negatives = negatives.unsqueeze(0)
-
-        print(f"positive shape: {positive.shape}")    # Should be (batch_size, embedding_dim)
-        print(f"negatives shape: {negatives.shape}")  # Should be (batch_size, num_negatives, embedding_dim)
-        
-        print(f"chunk1_embedding shape: {chunk1_embedding.shape}")          # Should be (batch_size, embedding_dim)
-        # Compute similarities
-        pos_sim = torch.sum(chunk1_embedding * positive, dim=-1) / self.temperature
-        neg_sim = torch.matmul(chunk1_embedding, negatives.transpose(1, 2)) / self.temperature
-
-        
-        print(f"pos_sim shape: {pos_sim.shape}")  # Should be (batch_size,)
-        print(f"neg_sim shape: {neg_sim.shape}")  # Should be (batch_size, num_negatives)
-
-        # Concatenate positive and negative similarities
-        logits = torch.cat((pos_sim.unsqueeze(1), neg_sim.squeeze(1)), dim=1)
-
-        # Create labels (first position is positive example)
-        labels = torch.zeros(chunk1_embedding.size(0), dtype=torch.long, device=chunk1_embedding.device)
-
-        loss = F.cross_entropy(logits, labels)
+        loss = F.cross_entropy(similarity_matrix, positive_indices)
         
         return loss
 
@@ -647,7 +636,7 @@ class DualEncoderT5Contrastive(pl.LightningModule):
 
         self.indexing_strategy = indexing_strategy
 
-        self.loss_fn = InfoNCELoss(temperature)
+        self.loss_fn = InfoNCELoss(self.device, temperature)
 
     def mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output.last_hidden_state
@@ -670,7 +659,7 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         
         normalized_output1 = F.normalize(pooled_output1, p=2, dim=1)
         normalized_output2 = F.normalize(pooled_output2, p=2, dim=1)
-        
+
         return normalized_output1, normalized_output2
 
     def compute_step(self, batch, batch_idx):
@@ -679,66 +668,45 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         chunk1_attention_mask = batch["chunk1_attention_mask"]
         chunk2_attention_mask = batch["chunk2_attention_mask"]
         
-        labels = batch['label']
         chunk1_embedding_norm, chunk2_embedding_norm = self.forward(chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask)
         
-        # Find the first positive row
-        positive_indices = torch.where(labels == 1)[0]
-        if len(positive_indices) == 0:
-            # Skip the batch if there are no positive examples
-            return None
+        ######### Need to separate this into the InfoNCE class:
+        chunk2_embedding_norm_transpose = chunk2_embedding_norm.transpose(0,1)
+        similarity_matrix = torch.matmul(chunk1_embedding_norm, chunk2_embedding_norm_transpose)
+        # I could implement temperature by dividing the similarity_matrix by it?
 
-        positive_index = positive_indices[0] # Get first positive case.
-        positive_chunk1_ids = chunk1_ids[positive_index]
-    
-        negative_indices = (labels == 0) | (
-            (labels == 1) & (chunk1_ids != positive_chunk1_ids.unsqueeze(0)).any(dim=1)
-        )
+        positive_indices = torch.arange(chunk1_embedding_norm.shape[0]).to(self.device)
 
-        positive_chunk1_embedding = chunk1_embedding_norm[positive_index]
-        positive_chunk2_embedding = chunk2_embedding_norm[positive_index]
+        loss = F.cross_entropy(similarity_matrix, positive_indices)
+        #########
         
-        #negatives_chunk1_embedding = chunk1_embedding_norm[negative_indices]
-        negatives_chunk2_embedding = chunk2_embedding_norm[negative_indices]
-
-        # Combine chunk1 and chunk2 negatives
-       # negatives = torch.cat([negatives_chunk1_embedding, negatives_chunk2_embedding], dim=0)
-        
-        if len(negatives_chunk2_embedding) == 0:
-            # Skip the batch if there are no negative examples
-            return None
-
-        # Compute InfoNCE loss
-        loss = self.loss_fn(positive_chunk1_embedding, positive_chunk2_embedding, negatives_chunk2_embedding)
-
+        #loss = self.loss_fn(chunk1_embedding_norm, chunk2_embedding_norm)
         return loss
 
     def training_step(self, batch, batch_idx):
         loss = self.compute_step(batch, batch_idx)
-        if loss is None:
-            return None
         self.log('train_loss', loss, prog_bar=True, logger=True, batch_size=len(batch))
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss = self.compute_step(batch, batch_idx)
-        if loss is None:
-            return None
         self.log('val_loss', loss, prog_bar=True, logger=True, batch_size=len(batch))
         return loss
     
     def on_validation_epoch_end(self):
+        print("Starting on_validation_epoch_end")
         asyncio.run(self.index_and_evaluate_val())
+        print("Finished on_validation_epoch_end")
 
     def test_step(self, batch, batch_idx):
         loss = self.compute_step(batch, batch_idx)
-        if loss is None:
-            return None
         self.log('test_loss', loss, prog_bar=True, logger=True, batch_size=len(batch))
         return loss
     
     def on_test_epoch_end(self):
+        print("Starting on_test_epoch_end")
         asyncio.run(self.index_and_evaluate_test())
+        print("Finished on_test_epoch_end")
 
     async def index_and_evaluate_test(self):
         await self.indexing_strategy.clear()
@@ -770,12 +738,12 @@ class DualEncoderT5Contrastive(pl.LightningModule):
 
         return normalized_output.cpu().numpy()  # Convert tensor to numpy array
 
-    async def compute_vector_search_mrr(self, dataset):
+    async def compute_vector_search_mrr(self, filtered_df: DataFrame):
         # Index into vector search
 
         # Get top items randomly from DF
         #  filtered_df = dataset.df[ (dataset.df['objective'] == 'predict_tail')].sample(frac=1, random_state=seed).head(df_size_limit).reset_index(drop=True)
-        filtered_df = dataset.df
+        # filtered_df = dataset.df
         #filtered_df = dataset.df.sample(frac=1, random_state=seed).head(df_size_limit).reset_index(drop=True)
         print(f"ANN df is length: {len(filtered_df)}")
 
@@ -963,12 +931,14 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         #self.ranks_dicts = ranks_dicts
     
     async def evaluate_all_test(self):
-        dataset = self.test_dataset
-        await self.compute_vector_search_mrr(dataset)
+        #dataset = self.test_dataset
+        df = self.data_module.test_ann_df
+        await self.compute_vector_search_mrr(df)
 
     async def evaluate_all_val(self):
-        dataset = self.val_dataset
-        await self.compute_vector_search_mrr(dataset)
+        df = self.data_module.val_ann_df
+        #dataset = self.val_dataset
+        await self.compute_vector_search_mrr(df)
 
 
 def main():
@@ -980,7 +950,7 @@ def main():
         tokenizer_name='t5-small', 
         batch_size=20, 
         max_length=1024, 
-        match_behavior = "pos",
+        match_behavior = "omit",
         train_size=0.80, 
         val_size=0.10, 
         test_size=0.10)
@@ -1004,8 +974,8 @@ def main():
         data_module=data_module, 
         model_name='t5-small',
         indexing_strategy=faiss_indexing_strategy, 
-        learning_rate=1e-5, 
-        temperature=0.2,
+        learning_rate=1e-3, 
+        temperature=0.5,
         margin=1.0)
     # Initialize trainer
 
@@ -1014,6 +984,10 @@ def main():
 
     trainer = pl.Trainer(max_epochs=50, accelerator="gpu", devices=-1,
                         enable_progress_bar=True,
+                        #limit_train_batches=3,
+                        # limit_val_batches=0,
+                        #enable_checkpointing=False,
+                        #callbacks=[EarlyStopping(monitor="val_loss", patience=2)],
                         callbacks=[ModelCheckpoint(monitor="ndcg10_predict_all"),
                                     EarlyStopping(monitor="ndcg10_predict_all", patience=3)],
                         logger=logger,
@@ -1022,7 +996,7 @@ def main():
     
 
     # Train the model
-    trainer.fit(model, datamodule=data_module)
+    #trainer.fit(model, datamodule=data_module)
     trainer.test(model=model, datamodule=data_module)
 
 
