@@ -1,3 +1,5 @@
+## This implementation is not currently converging. Needs more investigation. Try the other dual-encoder example.
+
 import torch
 import asyncio
 import torch
@@ -53,9 +55,9 @@ model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-012
 
 # Run from terminal: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 
-filename = "coarse_dual_T5_math_test_no_hard_neg"
-suffix = "simple"
-dataset_prefix = f"symbolic_math_example_{suffix}"
+filename = "coarse_dual_T5_InfoNCE_temp02_omit_lr3_batch20_hardneg_ndcg10_small"
+suffix = "small"
+dataset_prefix = f"pairs_for_embeddings_{suffix}_out_directed_top20neg"
 # Used at eval
 log_name = dataset_prefix + "___" + filename + "__" + suffix
 base_path = '/teamspace/studios/this_studio/experiments/dual-encoder/'
@@ -392,6 +394,7 @@ class ContrastiveSentencePairDataset(Dataset):
         chunk1 = self.df['chunk1'][idx]
         chunk2 = self.df['chunk2'][idx]
         result = self.df['result'][idx]
+        similar_negatives = self.df['similar_negatives'][idx]
 
         chunk1_tokenized = self.tokenizer(chunk1, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_length)
         chunk2_tokenized = self.tokenizer(chunk2, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_length)
@@ -404,6 +407,16 @@ class ContrastiveSentencePairDataset(Dataset):
 
         label = torch.tensor(self.labels[idx], dtype=torch.float)
 
+        similar_negatives_ids = []
+        similar_negatives_attention_masks = []
+
+        for neg in similar_negatives:
+            neg_tokenized = self.tokenizer(neg, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_length)
+            neg_ids = neg_tokenized['input_ids'].squeeze()
+            neg_attention_mask = neg_ids.ne(self.tokenizer.pad_token_id)
+            similar_negatives_ids.append(neg_ids)
+            similar_negatives_attention_masks.append(neg_attention_mask)
+
         return {
             "chunk1": chunk1, 
             "chunk2": chunk2,
@@ -412,7 +425,9 @@ class ContrastiveSentencePairDataset(Dataset):
             "chunk1_attention_mask": chunk1_attention_mask,
             "chunk2_attention_mask": chunk2_attention_mask,
             "result": result,
-            "label": label
+            "label": label,
+            "similar_negatives_ids": torch.stack(similar_negatives_ids),
+            "similar_negatives_attention_masks": torch.stack(similar_negatives_attention_masks)
         }
 
 class ContrastiveDataModule(pl.LightningDataModule):
@@ -513,6 +528,10 @@ class ContrastiveDataModule(pl.LightningDataModule):
         val_df = val_df[(val_df['result'] != 'NONE') & (val_df['result'].notna())].reset_index(drop=True)
         test_df = test_df[(test_df['result'] != 'NONE') & (test_df['result'].notna())].reset_index(drop=True)
 
+        assert len(train_df) > 0, "train_df is empty"
+        assert len(val_df) > 0, "val_df is empty"
+        assert len(test_df) > 0, "test_df is empty"
+
         print(f"Row count of train_df is: {train_df.shape[0]}")
         print(f"Row count of val_df is: {val_df.shape[0]}")
         print(f"Row count of test_df is: {test_df.shape[0]}")
@@ -544,7 +563,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
             else:
             # Load the dataset
                 df = pd.read_parquet(self.data_file)
-
+                assert len(df) > 0, "DataFrame is empty"
+                #test_df4 = pd.read_parquet('/teamspace/studios/this_studio/experiments/data_prep/pairs_for_embeddings_full_out_directed_top20neg.parquet')
                 # # Filter out cases where information is leaked through the descriptions:
                 # filtered_df = self.apply_description_filter(df)
 
@@ -600,21 +620,68 @@ class ContrastiveDataModule(pl.LightningDataModule):
         print(f"Test DataLoader batch size: {self.batch_size}")
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=7)
 
-class InfoNCELoss(nn.Module):
+class InfoNCELossWithHardNegatives(nn.Module):
     def __init__(self, temperature=0.1):
-        super(InfoNCELoss, self).__init__()
+        super(InfoNCELossWithHardNegatives, self).__init__()
         self.temperature = temperature
 
-    def forward(self, chunk1_embedding_norm, chunk2_embedding_norm):
+    def forward_individual(self, chunk1_embedding_norm: torch.Tensor, chunk2_embedding_norm: torch.Tensor, negatives_norm: torch.Tensor):
+        """
+        Use this method for a single batch item.
+        # chunk1_embedding_norm.shape: [vector_length]
+        # chunk2_embedding_norm.shape: [vector_length]
+        # negatives_norm.shape: [20, vector_length]
+        """
+
         device = chunk1_embedding_norm.device
-        chunk2_embedding_norm_transpose = chunk2_embedding_norm.transpose(0,1)
-        similarity_matrix = torch.matmul(chunk1_embedding_norm, chunk2_embedding_norm_transpose) / self.temperature
-        # I could implement temperature by dividing the similarity_matrix by it?
+        # Reshape to ensure compatible dimensions for matrix multiplication
+        chunk1_embedding_norm = chunk1_embedding_norm.unsqueeze(0)  # Shape: [1, vector_length]
+        chunk2_embedding_norm_transpose = chunk2_embedding_norm.unsqueeze(1)  # Shape: [vector_length, 1]
 
-        positive_indices = torch.arange(chunk1_embedding_norm.shape[0], device=device)
-
-        loss = F.cross_entropy(similarity_matrix, positive_indices)
+        positive_similarity = torch.matmul(chunk1_embedding_norm, chunk2_embedding_norm_transpose) / self.temperature
         
+        negatives_transpose = negatives_norm.transpose(0,1) # Shaped into [vector_length, 20] so we have 20 columns
+        negative_similarities = torch.matmul(chunk1_embedding_norm, negatives_transpose) / self.temperature # Gives shape: [1, 20]
+        
+        similarity_matrix = torch.cat((positive_similarity, negative_similarities), dim=1) # Should add column-wise. These are the logits.
+
+        positive_indices = torch.tensor([0], device=device)
+
+        loss = F.cross_entropy(similarity_matrix, positive_indices) # Expects dimensions: logits (batch_size, classes, ...); labels (batch_size, ...) where labels match input tensor except for classes
+        
+        return loss
+
+    
+    def forward(self, chunk1_embedding_norm: torch.Tensor, chunk2_embedding_norm: torch.Tensor, negatives_norm: torch.Tensor):
+        # chunk1_embedding_norm.shape: [batch_size, vector_length]
+        # chunk2_embedding_norm.shape: [batch_size, vector_length]
+        # negatives_norm.shape: [batch_size, 20, vector_length]
+
+        device = chunk1_embedding_norm.device
+        batch_size = chunk1_embedding_norm.shape[0]
+
+        # Reshape to ensure compatible dimensions for matrix multiplication
+        chunk1_embedding_norm = chunk1_embedding_norm.unsqueeze(1)  # Shape: [batch_size, 1, vector_length]
+        chunk2_embedding_norm = chunk2_embedding_norm.unsqueeze(2)  # Shape: [batch_size, vector_length, 1]
+
+        # Calculate positive similarities
+        positive_similarity = torch.bmm(chunk1_embedding_norm, chunk2_embedding_norm) / self.temperature  # Shape: [batch_size, 1, 1]
+        positive_similarity = positive_similarity.squeeze(2)  # Shape: [batch_size, 1]
+
+        # Calculate negative similarities
+        negatives_norm = negatives_norm.permute(0, 2, 1)  # Shape: [batch_size, vector_length, 20]
+        negative_similarities = torch.bmm(chunk1_embedding_norm, negatives_norm) / self.temperature  # Shape: [batch_size, 1, 20]
+        negative_similarities = negative_similarities.squeeze(1)  # Shape: [batch_size, 20]
+
+        # Concatenate positive and negative similarities
+        similarity_matrix = torch.cat((positive_similarity, negative_similarities), dim=1)  # Shape: [batch_size, 21]
+
+        # Target labels (all positives are at index 0)
+        target_labels = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        # Calculate loss
+        loss = F.cross_entropy(similarity_matrix, target_labels)  # Shape: scalar
+
         return loss
 
 # class ProjectionHead(nn.Module):
@@ -648,7 +715,7 @@ class DualEncoderT5Contrastive(pl.LightningModule):
 
         self.indexing_strategy = indexing_strategy
 
-        self.loss_fn = InfoNCELoss(temperature)
+        self.loss_fn = InfoNCELossWithHardNegatives(temperature)
 
     def mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output.last_hidden_state
@@ -657,7 +724,18 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
         return sum_embeddings / sum_mask
 
-    def forward(self, chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask):
+    # def contrastive_loss(self, z1, z2, labels):
+    #     logits = torch.matmul(z1, z2.T) / self.temperature
+    #     labels = torch.arange(z1.size(0), device=self.device)
+    #     return F.cross_entropy(logits, labels)
+
+    def forward_individual(self, chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask, similar_negatives_ids, similar_negatives_attention_masks):
+        """
+        Use this method for processing negatives in a loop (such as to reduce GPU memory).
+
+        chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask are all shape: [batch, token_limit]
+        similar_negatives_ids, similar_negatives_attention_masks are shape: [batch, negative_samples, token_limit]
+        """
         encoder1_outputs = self.encoder1(input_ids=chunk1_ids, attention_mask=chunk1_attention_mask)
         encoder2_outputs = self.encoder2(input_ids=chunk2_ids, attention_mask=chunk2_attention_mask)
         
@@ -667,20 +745,68 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         # projected_output1 = self.projection_head(pooled_output1)
         # projected_output2 = self.projection_head(pooled_output2)
         
-        normalized_output1 = F.normalize(pooled_output1, p=2, dim=1)
-        normalized_output2 = F.normalize(pooled_output2, p=2, dim=1)
+        normalized_output1 = F.normalize(pooled_output1, p=2, dim=1) # shape: [batch_size, vector_length]
+        normalized_output2 = F.normalize(pooled_output2, p=2, dim=1) # shape: [batch_size, vector_length]
 
-        return normalized_output1, normalized_output2
+        # Process each similar_negative through encoder2
+        normalized_negative_outputs = []
+        for neg_ids, neg_attention_mask in zip(similar_negatives_ids, similar_negatives_attention_masks):
+            neg_output = self.encoder2(input_ids=neg_ids, attention_mask=neg_attention_mask)
+            pooled_neg_output = self.mean_pooling(neg_output, neg_attention_mask)
+            normalized_neg_output = F.normalize(pooled_neg_output, p=2, dim=1)
+            normalized_negative_outputs.append(normalized_neg_output)
+
+        return normalized_output1, normalized_output2, normalized_negative_outputs
+
+    def forward(self, chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask, similar_negatives_ids, similar_negatives_attention_masks):
+        """
+        chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask are all shape: [batch, token_limit]
+        similar_negatives_ids, similar_negatives_attention_masks are shape: [batch, negative_samples, token_limit]
+        """
+        # Encode chunk1 and chunk2
+        encoder1_outputs = self.encoder1(input_ids=chunk1_ids, attention_mask=chunk1_attention_mask)
+        encoder2_outputs = self.encoder2(input_ids=chunk2_ids, attention_mask=chunk2_attention_mask)
+        
+        pooled_output1 = self.mean_pooling(encoder1_outputs, chunk1_attention_mask)
+        pooled_output2 = self.mean_pooling(encoder2_outputs, chunk2_attention_mask)
+
+        normalized_output1 = F.normalize(pooled_output1, p=2, dim=1) # shape: [batch_size, vector_length]
+        normalized_output2 = F.normalize(pooled_output2, p=2, dim=1) # shape: [batch_size, vector_length]
+
+        # Reshape negative samples to combine batch size and negative samples
+        batch_size, negative_samples, token_limit = similar_negatives_ids.shape
+        similar_negatives_ids = similar_negatives_ids.view(-1, token_limit)  # Shape: [batch_size * negative_samples, token_limit]
+        similar_negatives_attention_masks = similar_negatives_attention_masks.view(-1, token_limit)  # Shape: [batch_size * negative_samples, token_limit]
+
+        # Process all negative samples in a batch
+        neg_outputs = self.encoder2(input_ids=similar_negatives_ids, attention_mask=similar_negatives_attention_masks)
+        pooled_neg_outputs = self.mean_pooling(neg_outputs, similar_negatives_attention_masks)
+        normalized_neg_outputs = F.normalize(pooled_neg_outputs, p=2, dim=1)  # Shape: [batch_size * negative_samples, vector_length]
+
+        # Reshape back to original dimensions
+        normalized_neg_outputs = normalized_neg_outputs.view(batch_size, negative_samples, -1)  # Shape: [batch_size, negative_samples, vector_length]
+
+        return normalized_output1, normalized_output2, normalized_neg_outputs
 
     def compute_step(self, batch, batch_idx):
         chunk1_ids = batch["chunk1_ids"]
         chunk2_ids = batch["chunk2_ids"]
         chunk1_attention_mask = batch["chunk1_attention_mask"]
         chunk2_attention_mask = batch["chunk2_attention_mask"]
+        similar_negatives_ids = batch["similar_negatives_ids"]
+        similar_negatives_attention_masks = batch["similar_negatives_attention_masks"]
         
-        chunk1_embedding_norm, chunk2_embedding_norm = self.forward(chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask)
         
-        loss = self.loss_fn(chunk1_embedding_norm, chunk2_embedding_norm)
+        chunk1_embedding_norm, chunk2_embedding_norm, negatives_norm = self.forward(chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask, similar_negatives_ids, similar_negatives_attention_masks)
+        loss = self.loss_fn(chunk1_embedding_norm, chunk2_embedding_norm, negatives_norm) # make sure all 20 negatives are in given index
+        
+        # batch_size = chunk1_embedding_norm.shape[0]
+        # total_loss = 0.0
+        # for i in range(batch_size):
+        #     loss = self.loss_fn(chunk1_embedding_norm[i], chunk2_embedding_norm[i], negatives_norm[i]) # make sure all 20 negatives are in given index
+        #     total_loss += loss
+        
+       
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -948,7 +1074,7 @@ def main():
     data_module = ContrastiveDataModule(
         data_path=data_path, 
         tokenizer_name='t5-small', 
-        batch_size=2, 
+        batch_size=20, 
         max_length=1024, 
         match_behavior = "omit",
         train_size=0.80, 
