@@ -969,7 +969,7 @@ def main():
     #     default_limit=10
     # )
 
-    #model = DualEncoderT5Contrastive.load_from_checkpoint("/teamspace/jobs/coarse-dual-t5-cl-pos-lr5-batch16-temp02-margin1-amexpairs-baseline/nodes.0/coarse_dual_T5_CL_pos_lr5_batch16_temp02_margin1/AmexPairs_baseline___coarse_dual_T5_CL_pos_lr5_batch16_temp02_margin1__baseline/version_0/checkpoints/epoch=0-step=1473.ckpt",
+    #model = DualEncoderT5Contrastive.load_from_checkpoint("/teamspace/jobs/.../epoch=0-step=1473.ckpt",
     model = DualEncoderT5Contrastive(
         data_module=data_module, 
         model_name='t5-small',
