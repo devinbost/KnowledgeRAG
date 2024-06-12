@@ -2,30 +2,14 @@ import torch
 import asyncio
 import torch
 from torch.utils.data import DataLoader, Dataset
-from transformers import AdamW, T5Tokenizer, T5EncoderModel, T5Config
-from tqdm.auto import tqdm
-from sklearn.model_selection import train_test_split
-from dotenv import load_dotenv
-from langchain.chat_models import ChatOpenAI
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda, Runnable
-from langchain.prompts import PromptTemplate
+from transformers import AdamW, T5Tokenizer, T5EncoderModel
 from torchmetrics.retrieval import RetrievalMRR, RetrievalNormalizedDCG, RetrievalHitRate, RetrievalMAP, RetrievalAUROC
-from typing import Any, List, Optional
-import faiss
 import os
 import random
 import json
 import numpy as np
-from collections import defaultdict
-import re
-from abc import ABC, abstractmethod
 from pandas import DataFrame
 import pandas as pd
-from pydantic import BaseModel
-
-from typing import List, Optional
-from pydantic import BaseModel
 
 import sentencepiece
 print(sentencepiece.__version__)
@@ -33,7 +17,8 @@ print(sentencepiece.__version__)
 import lightning as pl
 import torch.nn as nn
 import torch.nn.functional as F
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+
+from dual_encoder import IndexingStrategy
 
 seed = 42
 random.seed(seed)
@@ -47,331 +32,11 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)  # For multi-GPU setups
 batch_size = 16
 
-load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-model = ChatOpenAI(api_key=api_key, temperature=0, model_name="gpt-3.5-turbo-0125")
-
 # Run from terminal: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 
-filename = "coarse_dual_T5_math_test_no_hard_neg"
-suffix = "simple"
-dataset_prefix = f"symbolic_math_example_{suffix}"
-# Used at eval
-log_name = dataset_prefix + "___" + filename + "__" + suffix
-base_path = '/teamspace/studios/this_studio/experiments/dual-encoder/'
-save_path = base_path + 'saves'
-data_path = base_path + 'data/' + dataset_prefix + '.parquet'
-
-torch.set_float32_matmul_precision("medium")
-
-vector_length = 512
-max_length = 1024
-
-class IndexingStrategy(ABC):
-    @abstractmethod
-    async def add(self, embeddings: np.ndarray, metadata: list) -> None:
-        pass
-
-    @abstractmethod
-    async def add_batch(self, embeddings_of_batch, dataframe_of_batch) -> None:
-        pass
-
-    @abstractmethod
-    async def search(self, query_embedding: np.ndarray, limit: int) -> list:
-        pass
-
-    @abstractmethod
-    async def batch_search(self, source_df: DataFrame) -> list:
-        pass
-
-    @abstractmethod
-    async def clear(self):
-        """Deletes all contents of index."""
-        pass
-
-# Concrete Strategy for FAISS Indexing
-class FaissIndexing(IndexingStrategy):
-    def __init__(self, vector_length: int, index_m: int, efConstruction: int):
-        self.index = faiss.IndexHNSWFlat(vector_length, index_m)
-        print("Faiss index dimension:", self.index.d)
-        self.index.hnsw.efConstruction = efConstruction
-        self.metadata = []
-        self.vector_length = vector_length
-        self.index_m = index_m
-        self.efConstruction = efConstruction
-        self.prediction_id_map = {}
-        self.added_ids = set()
-
-        self.added_chunks = set()
-
-        self.result_map = {}
-
-    def populate_result_map(self, row):
-        """
-        Function to populate the dictionary with (chunk1, chunk2) as key and result as value.
-        
-        Parameters:
-        row (pd.Series): A row of the DataFrame containing chunk1, chunk2, and result.
-        """
-        chunk1, chunk2, result = row['chunk1'], row['chunk2'], row['result']
-        # if chunk1 == chunk2:
-        #     print("debug")
-        self.result_map[(chunk1, chunk2)] = result
-        
-    def get_result(self, chunk1: str, chunk2: str):
-        """
-        Function to get the result from the dictionary given chunk1 and chunk2.
-        
-        Parameters:
-        chunk1 (str): The first chunk.
-        chunk2 (str): The second chunk.
-        
-        Returns:
-        str: The result corresponding to the provided chunk1 and chunk2.
-        """
-        return self.result_map.get((chunk1, chunk2), None)
-
-    async def add_all(self, full_dataframe):
-        full_dataframe.apply(lambda row: self.populate_result_map(row), axis=1)
-        with torch.no_grad():
-            filtered_df = full_dataframe
-            
-            # Calculate the number of batches
-            num_batches = len(filtered_df) // batch_size + (0 if len(filtered_df) % batch_size == 0 else 1)
-
-            # Process each batch
-            for batch_idx in range(num_batches):
-                # Slice the DataFrame to get the batch
-                start_idx = batch_idx * batch_size
-                end_idx = start_idx + batch_size
-                batch_df = filtered_df.iloc[start_idx:end_idx]
-
-                await self.add_batch(batch_df)
-        
-    #     await self.indexing_strategy.write_batch(ready_to_write)
-    async def add_batch(self, dataframe_of_batch: DataFrame) -> None:
-        metadata_entries = dataframe_of_batch.apply(
-            lambda row: {"_id": row['prediction_id'],**row.to_dict()}, axis=1).tolist()
-        
-        unique_embeddings = []
-        unique_metadata = []
-
-        for row in metadata_entries:
-            unique_id = row["_id"]
-            if unique_id not in self.added_ids:
-                self.added_ids.add(unique_id)
-
-                # if row["chunk1"] not in self.added_chunks:
-                #     unique_embeddings.append(row["chunk1_vector"])
-                #     unique_metadata.append({row["chunk1"]})
-                if row["chunk2"] not in self.added_chunks:
-                    unique_embeddings.append(row["chunk2_vector"])
-                    unique_metadata.append({"chunk2": row["chunk2"]})
-                    self.added_chunks.add(row["chunk2"])
-            else:
-                print("Found duplicate for row: " + str(row["_id"]))
-        
-        if unique_embeddings:
-            unique_embeddings = np.array(unique_embeddings)
-            await self.add(unique_embeddings, unique_metadata)
-    
-    async def add(self, embeddings: np.ndarray, metadata: List[dict]) -> None:
-        #print("Embedding shape before squeezing:", embeddings.shape)
-        embeddings = embeddings.squeeze()
-        if embeddings.ndim == 1:
-        # Reshape if squeezing reduced to 1D
-            embeddings = embeddings.reshape(1, -1) # Creates puts all columns into a single row
-        #print("Embedding shape after squeezing:", embeddings.shape)
-        self.index.add(embeddings)
-        self.metadata.extend(metadata)
-
-    async def search(self, query_embedding: np.ndarray, limit: int) -> List[List[Any]]:
-        distances, indices = self.index.search(query_embedding, limit)
-        batch_results = []
-        for distance_row, index_row in zip(distances, indices):
-            results = [(self.metadata[idx], dist) for idx, dist in zip(index_row, distance_row)]
-            batch_results.append(results[:limit])
-        return batch_results
-
-    async def batch_search(self, source_df: DataFrame) -> List[tuple]:
-        question_vectors = source_df["chunk1_vector"].tolist()
-        batch_vectors = np.vstack(question_vectors)
-
-        distances, indices = self.index.search(batch_vectors, len(self.metadata))
-        batch_results = []
-
-        for idx, (distance_row, index_row) in enumerate(zip(distances, indices)):
-            source_row = source_df.iloc[idx]
-            results = [(self.metadata[idx], dist) for idx, dist in zip(index_row, distance_row)]
-            results_sorted = sorted(results, key=lambda x: x[1])  # Sort by distance
-            unique_idx = source_row["prediction_id"]
-            # if source_row["objective"] == "predict_tail":
-            #     tails = [(source_row["head"], source_row["relation"], res[0]['tail'], res[0]['tail_description']) for res in results_sorted]
-            #     distinct_tails = list({(head, relation, tail, tail_description) for head, relation, tail, tail_description in tails})
-            #top10tails = results_sorted[:10]
-            #print(top10tails)
-
-            for result in results_sorted:
-
-                target_chunk = result[0]["chunk2"]
-                edge_of_pair = self.get_result(source_row["chunk1"], target_chunk)
-                has_edge = edge_of_pair is not None and edge_of_pair != "NONE"
-
-                pred = has_edge
-
-                similarity = 1 / (1 + result[1])  # Convert distance to similarity
-                
-                batch_results.append((unique_idx, similarity, pred, source_row["chunk1"], target_chunk, has_edge))
-                
-
-        return batch_results
-
-    async def clear(self):
-        """Just reinitialize to clear."""
-        self.index = faiss.IndexHNSWFlat(self.vector_length, self.index_m)
-        self.index.hnsw.efConstruction = self.efConstruction
-        self.metadata = []
-        self.added_ids.clear()
-        self.prediction_id_map = {}
-        self.added_chunks = set()
-        self.result_map = {}
-
-    def get_prediction_id(self, string: str) -> int:
-        if string not in self.prediction_id_map:
-            self.prediction_id_map[string] = len(self.prediction_id_map)
-        return self.prediction_id_map[string]
-
-# Concrete Strategy for AstraDB Indexing
-class AstraDBIndexing(IndexingStrategy):
-    def __init__(self, token: str, api_endpoint: str, collection_name: str, vector_length: int, default_limit: int):
-        self.astrapy_db = AsyncAstraDB(token=token, api_endpoint=api_endpoint)
-        self.collection_name = collection_name
-        self.vector_length = vector_length
-        self.default_limit = default_limit
-        self.collection = None
-        self.prediction_id_map = {}
-
-    async def initialize_collection(self):
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        mycollections = await self.astrapy_db.get_collections()
-        if self.collection_name not in mycollections["status"]["collections"]:
-            self.collection = await self.astrapy_db.create_collection(collection_name=self.collection_name, dimension=self.vector_length)
-        else:
-            self.collection = AsyncAstraDBCollection(collection_name=self.collection_name, astra_db=self.astrapy_db)
-
-    async def add_all(self, full_dataframe: DataFrame):
-        with torch.no_grad():
-            filtered_df = full_dataframe
-            
-            # Calculate the number of batches
-            num_batches = len(filtered_df) // batch_size + (0 if len(filtered_df) % batch_size == 0 else 1)
-
-            pair = []
-
-            # Process each batch
-            for batch_idx in range(num_batches):
-                # Slice the DataFrame to get the batch
-                start_idx = batch_idx * batch_size
-                end_idx = start_idx + batch_size
-                batch_df = filtered_df.iloc[start_idx:end_idx]
-
-                await self.add_batch(batch_df)
-    
-    async def add_batch(self, dataframe_of_batch) -> None:
-        ready_to_write = []
-        
-        for index, row in dataframe_of_batch.iterrows():
-            if isinstance(row["SourceVector"], np.ndarray):
-                row["SourceVector"] = row["SourceVector"].squeeze().tolist()
-            unique_id = row['prediction_id']
-            prediction_id = self.get_prediction_id(unique_id)
-            row["prediction_id"] = prediction_id
-            new_obj = {"$vector": row["SourceVector"], "_id": unique_id, **row}
-            ready_to_write.append(new_obj)
-        
-        await self.write_batch(ready_to_write)
-
-    async def write_batch(self, batch) -> None:
-        if self.collection is None:
-            await self.initialize_collection()
-        try:
-            await self.collection.insert_many(batch, partial_failures_allowed=True)
-        except Exception as e:
-            print(f"Error: {e}")
-    
-    async def add(self, embeddings: np.ndarray, metadata: list) -> None:
-        for embed, meta in tqdm(zip(embeddings, metadata), total=len(metadata)):
-            document = {"_id": meta[6]["Source"], "$vector": embed.tolist(), **meta[6]} # Caution: meta[6] currently is the dict, but be careful the contract doesn't change.
-            try:
-                await self.collection.insert_one(document)
-            except Exception as e:
-                print(f"Error: {e}")
-    
-    async def search(self, query_embedding: np.ndarray, limit: int) -> list:
-        await self.initialize_collection()
-        result = await self.collection.vector_find(
-            vector=query_embedding.tolist(),
-            limit=limit
-        )
-        return result
-    
-    async def batch_search(self, source_df: DataFrame):
-        batch_results = []
-        for idx, source_row in source_df.iterrows():
-            results = await self.collection.vector_find(
-                vector=source_row["SourceVector"].squeeze().tolist(),
-                limit=self.default_limit
-            )
-            # Commented block below is just for debugging/evaluation:
-            # Sort the results by $similarity in descending order
-            # results_sorted = sorted(results, key=lambda x: x['$similarity'], reverse=True)
-            #  # Extract "tail" and "tail_description" when "objective" == "predict_tail"
-            # if source_row["objective"] == "predict_tail":
-            #     src = source_row["Source"]
-            #     tails = [(source_row["head"], source_row["relation"], res['tail'], res['tail_description']) for res in results_sorted]
-            #     distinct_tails = list({(head, relation, tail, tail_description) for head, relation, tail, tail_description in tails})
-            #     top10tails = distinct_tails[:10]
-            #     print(top10tails)
-
-            # if source_row["objective"] == "predict_relation":
-            #     # Extract "head" and "tail" when "objective" == "predict_relation"
-            #     src = source_row["Source"]
-            #     relations = [(source_row['head'], res['relation'], source_row['tail']) for res in results_sorted]
-            #     distinct_relations = list({(head, relation, tail) for head, relation, tail in relations})
-            #     top10relations = distinct_relations[:10]
-            #     print(top10relations)
-
-            for result in results:
-                unique_idx = source_row["prediction_id"]
-                similarity = result['$similarity']
-
-                if source_row["objective"] == "predict_tail":
-                    pred = source_row["tail"] == result["tail"]
-                    if pred == True:
-                        print(source_row["Source"])
-                    batch_results.append((unique_idx, similarity, pred, "predict_tail"))
-                elif source_row["objective"] == "predict_head":
-                    pred = source_row["head"] == result["head"]
-                    batch_results.append((unique_idx, similarity, pred, "predict_head"))
-                elif source_row["objective"] == "predict_relation":
-                    pred = source_row["relation"] == result["relation"]
-                    batch_results.append((unique_idx, similarity, pred, "predict_relation"))
-        return batch_results
-
-    async def clear(self):
-        await self.initialize_collection()
-        await self.collection.clear()
-
-    def get_prediction_id(self, string):
-        if string not in self.prediction_id_map:
-            self.prediction_id_map[string] = len(self.prediction_id_map)
-        return self.prediction_id_map[string]
 
 class ContrastiveSentencePairDataset(Dataset):
-    def __init__(self, df: DataFrame, tokenizer, max_length=max_length):
+    def __init__(self, df: DataFrame, tokenizer, max_length):
         self.sentence_pairs = [
             (row['chunk1'], row['chunk2']) for idx, row in df.iterrows()
         ]
@@ -416,7 +81,7 @@ class ContrastiveSentencePairDataset(Dataset):
         }
 
 class ContrastiveDataModule(pl.LightningDataModule):
-    def __init__(self, data_path, tokenizer_name='t5-base', batch_size=16, max_length=1024, random_state=42, match_behavior = "omit", train_size=0.98, val_size=0.01, test_size=0.01):
+    def __init__(self, data_path, dataset_prefix: str, save_path: str, tokenizer_name='t5-base', batch_size=16, max_length=1024, random_state=42, match_behavior = "omit", train_size=0.98, val_size=0.01, test_size=0.01):
         super().__init__()
         self.data_path = data_path
         self.tokenizer_name = tokenizer_name
@@ -478,7 +143,6 @@ class ContrastiveDataModule(pl.LightningDataModule):
         all_entities = pd.concat([filtered_df['chunk1'], filtered_df['chunk2']]).unique()
 
         # Step 2: Shuffle entities
-        np.random.seed(42)
         np.random.shuffle(all_entities)
 
         # Step 3: Allocate entities to splits based on defined sizes
@@ -747,21 +411,6 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         #filtered_df = dataset.df.sample(frac=1, random_state=seed).head(df_size_limit).reset_index(drop=True)
         print(f"ANN df is length: {len(filtered_df)}")
 
-        tail_targets = []
-        tail_results = []
-        tail_indexes = []
-
-        head_targets = []
-        head_results = []
-        head_indexes = []
-        
-        relation_targets = []
-        relation_results = []
-        relation_indexes = []
-
-        all_targets = []
-        all_results = []
-        all_indexes = []
 
         # Prepare data for vectorized operations
         #sources = filtered_df["Source"].tolist()
@@ -782,12 +431,6 @@ class DualEncoderT5Contrastive(pl.LightningModule):
             filtered_df = filtered_df[filtered_df['chunk1_id'] != filtered_df['chunk2_id']].reset_index(drop=True)
         
         all_result_list = await self.indexing_strategy.batch_search(filtered_df) # (unique_idx, similarity/pred, true/false, objective)
-
-        
-
-        # tail_list = [r for r in all_result_list if r[3] == "predict_tail"]
-        # head_list = [r for r in all_result_list if r[3] == "predict_head"]
-        # relation_list = [r for r in all_result_list if r[3] == "predict_relation"]
 
         # Unpack and convert to lists
         all_unique_idx_list, all_similarity_list, all_true_false_list, all_chunk1_list, all_chunk2_list, all_has_edge_list = zip(*all_result_list)
@@ -914,21 +557,6 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         print(f"Computed AUROCs (Top-3): {auroc3s['all']}")
         print(f"Computed AUROCs (Top-5): {auroc5s['all']}")
         print(f"Computed AUROCs (Top-10): {auroc10s['all']}")
-
-    # async def evaluate(self, batch, mode='val'):
-    #     ranks_dicts = []
-
-    #     if mode == "val":
-    #         dataset = self.val_dataset
-    #     elif mode == "test":
-    #         dataset = self.test_dataset
-    #     elif mode == "train":
-    #         dataset = self.train_dataset
-
-    #     ranks_dicts = await self.compute_vector_search_mrr(dataset)
-        #ranks_dicts = self.compute_model_mrr(batch, dataset, ranks_dicts)
-
-        #self.ranks_dicts = ranks_dicts
     
     async def evaluate_all_test(self):
         #dataset = self.test_dataset
@@ -939,67 +567,3 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         df = self.data_module.val_ann_df
         #dataset = self.val_dataset
         await self.compute_vector_search_mrr(df)
-
-
-def main():
-   
-    # Initialize
-    #data_module = ContrastiveDataModule.,
-    data_module = ContrastiveDataModule(
-        data_path=data_path, 
-        tokenizer_name='t5-small', 
-        batch_size=2, 
-        max_length=1024, 
-        match_behavior = "omit",
-        train_size=0.80, 
-        val_size=0.10, 
-        test_size=0.10)
-
-        # train_size=0.90, 
-        # val_size=0.05, 
-        # test_size=0.05)
-
-    data_module.setup()
-    faiss_indexing_strategy = FaissIndexing(vector_length=vector_length, index_m=32, efConstruction=200)
-    # astradb_indexing_strategy = AstraDBIndexing(
-    #     token=os.getenv("ASTRA_TOKEN"), 
-    #     api_endpoint=os.getenv("ASTRA_API_ENDPOINT"), 
-    #     collection_name=os.getenv("ASTRA_COLLECTION"), 
-    #     vector_length=vector_length, 
-    #     default_limit=10
-    # )
-
-    #model = DualEncoderT5Contrastive.load_from_checkpoint("/teamspace/jobs/.../epoch=0-step=1473.ckpt",
-    model = DualEncoderT5Contrastive(
-        data_module=data_module, 
-        model_name='t5-small',
-        indexing_strategy=faiss_indexing_strategy, 
-        learning_rate=1e-3, 
-        temperature=0.2,
-        margin=1.0)
-    # Initialize trainer
-
-    from lightning.pytorch.loggers import TensorBoardLogger
-    logger = TensorBoardLogger(filename, name=log_name)
-
-    trainer = pl.Trainer(max_epochs=50, accelerator="gpu", devices=-1,
-                        enable_progress_bar=True,
-                        #limit_train_batches=3,
-                        # limit_val_batches=0,
-                        #enable_checkpointing=False,
-                        #callbacks=[EarlyStopping(monitor="val_loss", patience=2)],
-                        callbacks=[ModelCheckpoint(monitor="ndcg10_predict_all"),
-                                    EarlyStopping(monitor="ndcg10_predict_all", patience=3, mode="max")],
-                        logger=logger,
-                        precision="16-mixed")
-
-    
-
-    # Train the model
-    trainer.fit(model, datamodule=data_module)
-    trainer.test(model=model, datamodule=data_module)
-
-
-
-if __name__ == "__main__":
-    main()
