@@ -1,7 +1,7 @@
-from dual_encoder.t5_contrastive import DualEncoderT5Contrastive, ContrastiveSentencePairDataset, ContrastiveDataModule, InfoNCELoss
+from .t5_contrastive import DualEncoderT5Contrastive, ContrastiveSentencePairDataset, ContrastiveDataModule, InfoNCELoss
 
-from dual_encoder.indexing_strategy import IndexingStrategy
-from dual_encoder.astradb_indexing import AstraDBIndexing
-from dual_encoder.faiss_indexing import FaissIndexing
+from .indexing_strategy import IndexingStrategy
+from .astradb_indexing import AstraDBIndexing
+from .faiss_indexing import FaissIndexing
 
 
