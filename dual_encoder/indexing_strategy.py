@@ -1,7 +1,7 @@
 import numpy as np
 from abc import ABC, abstractmethod
 from pandas import DataFrame
-
+print("importing indexing_strategy file")
 class IndexingStrategy(ABC):
     @abstractmethod
     async def add(self, embeddings: np.ndarray, metadata: list) -> None:

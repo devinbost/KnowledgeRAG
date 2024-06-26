@@ -1,5 +1,7 @@
-from dual_encoder.IndexingStrategy import IndexingStrategy
-from astrapy import AsyncAstraDB, AsyncAstraDBCollection
+print("Importing astradb_indexing")
+from .indexing_strategy import IndexingStrategy
+print("Importing astradb_indexing, part 2")
+from astrapy.db import AsyncAstraDB, AsyncAstraDBCollection
 import asyncio
 import numpy as np
 from pandas import DataFrame

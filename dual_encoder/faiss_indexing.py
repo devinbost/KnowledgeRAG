@@ -4,8 +4,9 @@ from abc import ABC, abstractmethod
 from pandas import DataFrame
 from typing import Any, List
 import torch
-from dual_encoder.IndexingStrategy import IndexingStrategy
-
+print("Importing faiss_indexing")
+from .indexing_strategy import IndexingStrategy
+print("Importing faiss_indexing, part 2")
 seed = 42
 import random
 random.seed(seed)

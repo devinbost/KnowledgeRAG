@@ -18,7 +18,9 @@ import lightning as pl
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dual_encoder import IndexingStrategy
+print("Importing IndexingStrategy in t5_contrastive")
+from .indexing_strategy import IndexingStrategy
+print("Importing IndexingStrategy in t5_contrastive, part 2")
 
 seed = 42
 random.seed(seed)
