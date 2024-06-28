@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 print("Importing IndexingStrategy in t5_contrastive")
 from .indexing_strategy import IndexingStrategy
+from .kg_embedding import KGEmbedding
 print("Importing IndexingStrategy in t5_contrastive, part 2")
 
 seed = 42
@@ -82,26 +83,32 @@ class ContrastiveSentencePairDataset(Dataset):
             "label": label
         }
 
+
 class ContrastiveDataModule(pl.LightningDataModule):
-    def __init__(self, data_path, dataset_prefix: str, save_path: str, tokenizer_name='t5-base', batch_size=16, max_length=1024, random_state=42, match_behavior = "omit", train_size=0.98, val_size=0.01, test_size=0.01):
+    def __init__(self, data_path, extra_tokens, indexing_strategy: IndexingStrategy, tokenizer_name='t5-base',
+                 batch_size=16, max_length=1024, random_state=42, match_behavior="omit", train_size=0.98, val_size=0.01,
+                 test_size=0.01):
         super().__init__()
         self.data_path = data_path
         self.tokenizer_name = tokenizer_name
         self.batch_size = batch_size
         self.max_length = max_length
-        self.train_size=train_size
-        self.val_size=val_size
-        self.test_size=test_size
+        self.train_size = train_size
+        self.val_size = val_size
+        self.test_size = test_size
         assert train_size + val_size + test_size == 1.00
         self.random_state = random_state
         self.tokenizer = T5Tokenizer.from_pretrained(self.tokenizer_name)
+        # self.extra_tokens = extra_tokens
+        self.tokenizer.add_tokens(extra_tokens)
         self.first_run = True
         self.data_file = data_path
         self.match_behavior = match_behavior
+        self.indexing_strategy = indexing_strategy
 
         full_prefix = f"{dataset_prefix}_{match_behavior}_{train_size}_{val_size}_{test_size}"
 
-        self.train_file = os.path.join(save_path,f"{full_prefix}_train_df.parquet")
+        self.train_file = os.path.join(save_path, f"{full_prefix}_train_df.parquet")
         self.val_file = os.path.join(save_path, f"{full_prefix}_val_df.parquet")
         self.test_file = os.path.join(save_path, f"{full_prefix}_test_df.parquet")
         self.entities_count_file = os.path.join(save_path, f"{full_prefix}_entities_count.json")
@@ -125,11 +132,11 @@ class ContrastiveDataModule(pl.LightningDataModule):
             df.loc[df['chunk1'] == df['chunk2'], 'result'] = 'MATCH'
         else:
             raise Exception("Unknown match parameter provided")
-        
+
         # Sort the dataframe to ensure that the first non-"NONE" result appears first
         df_sorted = df.sort_values(by=['chunk1', 'chunk2', 'result'], ascending=[True, True, True])
 
-        # Group by chunk1 and chunk2 and apply the condition to filter out any extra rows (ensuring the remaining one is not "NONE") 
+        # Group by chunk1 and chunk2 and apply the condition to filter out any extra rows (ensuring the remaining one is not "NONE")
         def filter_results(group):
             # Check if there are any results that are not "NONE"
             non_none = group[(group['result'] != 'NONE') & (group['result'].notna())]
@@ -145,22 +152,29 @@ class ContrastiveDataModule(pl.LightningDataModule):
         all_entities = pd.concat([filtered_df['chunk1'], filtered_df['chunk2']]).unique()
 
         # Step 2: Shuffle entities
+        np.random.seed(42)
         np.random.shuffle(all_entities)
 
         # Step 3: Allocate entities to splits based on defined sizes
         total_entities = len(all_entities)
         train_end = int(np.floor(train_size * total_entities))
         val_end = train_end + int(np.floor(val_size * total_entities))
-        
+
         self.train_entities = set(all_entities[:train_end])
         self.val_entities = set(all_entities[train_end:val_end])
         self.test_entities = set(all_entities[val_end:])
 
         # Step 4: Assign rows to splits based on entity allocation
         # This version is for inductive on both head and tail:
-        train_df = filtered_df[filtered_df.apply(lambda row: row['chunk1'] in self.train_entities and row['chunk2'] in self.train_entities, axis=1)].reset_index(drop=True)
-        val_df = filtered_df[filtered_df.apply(lambda row: row['chunk1'] in self.val_entities and row['chunk2'] in self.val_entities, axis=1)].reset_index(drop=True)
-        test_df = filtered_df[filtered_df.apply(lambda row: row['chunk1'] in self.test_entities and row['chunk2'] in self.test_entities, axis=1)].reset_index(drop=True)
+        train_df = filtered_df[
+            filtered_df.apply(lambda row: row['chunk1'] in self.train_entities and row['chunk2'] in self.train_entities,
+                              axis=1)].reset_index(drop=True)
+        val_df = filtered_df[
+            filtered_df.apply(lambda row: row['chunk1'] in self.val_entities and row['chunk2'] in self.val_entities,
+                              axis=1)].reset_index(drop=True)
+        test_df = filtered_df[
+            filtered_df.apply(lambda row: row['chunk1'] in self.test_entities and row['chunk2'] in self.test_entities,
+                              axis=1)].reset_index(drop=True)
 
         # # This version is for semi-inductive (inductive on head, transductive on tail):
         # train_df = df[df.apply(lambda row: row['head'] in self.train_entities, axis=1)].reset_index(drop=True)
@@ -174,7 +188,7 @@ class ContrastiveDataModule(pl.LightningDataModule):
 
         val_ann_df = val_df
         test_ann_df = test_df
-        
+
         train_df = train_df[(train_df['result'] != 'NONE') & (train_df['result'].notna())].reset_index(drop=True)
         val_df = val_df[(val_df['result'] != 'NONE') & (val_df['result'].notna())].reset_index(drop=True)
         test_df = test_df[(test_df['result'] != 'NONE') & (test_df['result'].notna())].reset_index(drop=True)
@@ -194,7 +208,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         if self.first_run:
-            if os.path.exists(self.train_file) and os.path.exists(self.val_file) and os.path.exists(self.test_file) and os.path.exists(self.entities_count_file):
+            if os.path.exists(self.train_file) and os.path.exists(self.val_file) and os.path.exists(
+                    self.test_file) and os.path.exists(self.entities_count_file):
                 # Load the datasets if they already exist
                 print("Loading preprocessed datasets...")
                 train_df = pd.read_parquet(self.train_file)
@@ -208,23 +223,23 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 num_val_entities = entities_count['num_val_entities']
                 num_test_entities = entities_count['num_test_entities']
             else:
-            # Load the dataset
+                # Load the dataset
                 df = pd.read_parquet(self.data_file)
 
                 # # Filter out cases where information is leaked through the descriptions:
                 # filtered_df = self.apply_description_filter(df)
 
                 # Split the full dataframe into training, validation, and test sets
-                train_df, val_df, test_df, val_ann_df, test_ann_df = self.create_strict_splits(df, 
-                    train_size=self.train_size, 
-                    val_size=self.val_size, 
-                    test_size=self.test_size)
+                train_df, val_df, test_df, val_ann_df, test_ann_df = self.create_strict_splits(df,
+                                                                                               train_size=self.train_size,
+                                                                                               val_size=self.val_size,
+                                                                                               test_size=self.test_size)
 
                 # # Apply transformations to each split
                 # train_df = self.prepare_dataset(train_df)
                 # val_df = self.prepare_dataset(val_df)
                 # test_df = self.prepare_dataset(test_df)
-                
+
                 train_df.to_parquet(self.train_file)
                 val_df.to_parquet(self.val_file)
                 test_df.to_parquet(self.test_file)
@@ -246,14 +261,13 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 print(f"Row count of val_df is: {val_df.shape[0]}")
                 print(f"Row count of test_df is: {test_df.shape[0]}")
             # Assign dataset instances for each split
-            self.train_dataset = ContrastiveSentencePairDataset(train_df, self.tokenizer, self.max_length)
-            self.val_dataset = ContrastiveSentencePairDataset(val_df, self.tokenizer, self.max_length)
-            self.test_dataset = ContrastiveSentencePairDataset(test_df, self.tokenizer, self.max_length)
+            self.train_dataset = ContrastiveSentencePairDatasetTokenized(train_df, self.tokenizer, self.max_length)
+            self.val_dataset = ContrastiveSentencePairDatasetTokenized(val_df, self.tokenizer, self.max_length)
+            self.test_dataset = ContrastiveSentencePairDatasetTokenized(test_df, self.tokenizer, self.max_length)
             self.first_run = False
             self.val_ann_df = val_ann_df
             self.test_ann_df = test_ann_df
 
-    
     def train_dataloader(self):
         print(f"Train DataLoader batch size: {self.batch_size}")
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=7)
@@ -297,55 +311,24 @@ class InfoNCELoss(nn.Module):
 #         return x
 
 class DualEncoderT5Contrastive(pl.LightningModule):
-    def __init__(self, data_module: ContrastiveDataModule, model_name: str, indexing_strategy: IndexingStrategy, learning_rate=1e-3, temperature=0.2, margin=1.0):
+    def __init__(self, model: KGEmbedding, learning_rate=1e-3, temperature=0.2, margin=1.0):
         # super(DualEncoderT5Contrastive, self).__init__()
         super().__init__()
-        self.data_module = data_module
-        self.tokenizer = data_module.tokenizer
-        self.train_dataset = data_module.train_dataset
-        self.val_dataset = data_module.val_dataset
-        self.test_dataset = data_module.test_dataset
-
-        self.encoder1 = T5EncoderModel.from_pretrained(model_name)
-        self.encoder2 = T5EncoderModel.from_pretrained(model_name)
+        self.model = model
         self.learning_rate = learning_rate
         self.temperature = temperature
-        #self.projection_head = ProjectionHead(vector_length)
-
-        self.indexing_strategy = indexing_strategy
+        # self.projection_head = ProjectionHead(vector_length)
 
         self.loss_fn = InfoNCELoss(temperature)
-
-    def mean_pooling(self, model_output, attention_mask):
-        token_embeddings = model_output.last_hidden_state
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-        return sum_embeddings / sum_mask
-
-    def forward(self, chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask):
-        encoder1_outputs = self.encoder1(input_ids=chunk1_ids, attention_mask=chunk1_attention_mask)
-        encoder2_outputs = self.encoder2(input_ids=chunk2_ids, attention_mask=chunk2_attention_mask)
-        
-        pooled_output1 = self.mean_pooling(encoder1_outputs, chunk1_attention_mask)
-        pooled_output2 = self.mean_pooling(encoder2_outputs, chunk2_attention_mask)
-
-        # projected_output1 = self.projection_head(pooled_output1)
-        # projected_output2 = self.projection_head(pooled_output2)
-        
-        normalized_output1 = F.normalize(pooled_output1, p=2, dim=1)
-        normalized_output2 = F.normalize(pooled_output2, p=2, dim=1)
-
-        return normalized_output1, normalized_output2
 
     def compute_step(self, batch, batch_idx):
         chunk1_ids = batch["chunk1_ids"]
         chunk2_ids = batch["chunk2_ids"]
         chunk1_attention_mask = batch["chunk1_attention_mask"]
         chunk2_attention_mask = batch["chunk2_attention_mask"]
-        
-        chunk1_embedding_norm, chunk2_embedding_norm = self.forward(chunk1_ids, chunk1_attention_mask, chunk2_ids, chunk2_attention_mask)
-        
+        chunk1_embedding_norm = self.model.forward(chunk1_ids, chunk1_attention_mask, 1, False)
+        chunk2_embedding_norm = self.model.forward(chunk2_ids, chunk2_attention_mask, 2, False)
+
         loss = self.loss_fn(chunk1_embedding_norm, chunk2_embedding_norm)
         return loss
 
@@ -358,7 +341,7 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         loss = self.compute_step(batch, batch_idx)
         self.log('val_loss', loss, prog_bar=True, logger=True, batch_size=len(batch))
         return loss
-    
+
     def on_validation_epoch_end(self):
         print("Starting on_validation_epoch_end")
         asyncio.run(self.index_and_evaluate_val())
@@ -368,75 +351,53 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         loss = self.compute_step(batch, batch_idx)
         self.log('test_loss', loss, prog_bar=True, logger=True, batch_size=len(batch))
         return loss
-    
+
     def on_test_epoch_end(self):
         print("Starting on_test_epoch_end")
         asyncio.run(self.index_and_evaluate_test())
         print("Finished on_test_epoch_end")
 
     async def index_and_evaluate_test(self):
-        await self.indexing_strategy.clear()
+        await self.trainer.datamodule.indexing_strategy.clear()
         await self.evaluate_all_test()
 
     async def index_and_evaluate_val(self):
-        await self.indexing_strategy.clear()
+        await self.trainer.datamodule.indexing_strategy.clear()
         await self.evaluate_all_val()
-    
+
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.learning_rate)
         return optimizer
 
-    def prepare_query_vector(self, chunk_text:str, encoder: int):
-        tokenized_chunk = self.tokenizer(chunk_text, return_tensors='pt', padding=True, truncation=True, max_length=self.data_module.max_length).to(self.device)
-        chunk_ids = tokenized_chunk['input_ids'].to(self.device)
-        chunk_attention_mask = tokenized_chunk['attention_mask'].to(self.device)
-
-        with torch.no_grad():
-            if encoder == 1:
-                encoder_outputs = self.encoder1(input_ids=chunk_ids, attention_mask=chunk_attention_mask)
-            elif encoder == 2:
-                encoder_outputs = self.encoder2(input_ids=chunk_ids, attention_mask=chunk_attention_mask)
-            else:
-                raise
-
-            pooled_output = self.mean_pooling(encoder_outputs, chunk_attention_mask)
-            normalized_output = F.normalize(pooled_output, p=2, dim=1)
-
-        return normalized_output.cpu().numpy()  # Convert tensor to numpy array
-
     async def compute_vector_search_mrr(self, filtered_df: DataFrame):
         # Index into vector search
-
-        # Get top items randomly from DF
-        #  filtered_df = dataset.df[ (dataset.df['objective'] == 'predict_tail')].sample(frac=1, random_state=seed).head(df_size_limit).reset_index(drop=True)
-        # filtered_df = dataset.df
-        #filtered_df = dataset.df.sample(frac=1, random_state=seed).head(df_size_limit).reset_index(drop=True)
         print(f"ANN df is length: {len(filtered_df)}")
 
+        filtered_df['chunk1_vector'] = filtered_df.apply(
+            lambda row: self.model.prepare_source_vector(row['chunk1'], self.device), axis=1)
+        filtered_df['chunk2_vector'] = filtered_df.apply(
+            lambda row: self.model.prepare_target_vector(row['chunk2'], self.device), axis=1)
+        filtered_df['chunk1_id'] = filtered_df.apply(
+            lambda row: self.trainer.datamodule.indexing_strategy.get_prediction_id(row['chunk1']), axis=1)
+        filtered_df['chunk2_id'] = filtered_df.apply(
+            lambda row: self.trainer.datamodule.indexing_strategy.get_prediction_id(row['chunk2']), axis=1)
+        filtered_df['prediction_id'] = filtered_df.apply(
+            lambda row: self.trainer.datamodule.indexing_strategy.get_prediction_id(f"{row['chunk1']}|{row['chunk2']}"),
+            axis=1)
 
-        # Prepare data for vectorized operations
-        #sources = filtered_df["Source"].tolist()
-        
-        filtered_df['chunk1_vector'] = filtered_df.apply(lambda row: self.prepare_query_vector(row['chunk1'], encoder=1), axis=1)
-        filtered_df['chunk2_vector'] = filtered_df.apply(lambda row: self.prepare_query_vector(row['chunk2'], encoder=2), axis=1)
-        filtered_df['chunk1_id'] = filtered_df.apply(lambda row: self.indexing_strategy.get_prediction_id(row['chunk1']), axis=1)
-        filtered_df['chunk2_id'] = filtered_df.apply(lambda row: self.indexing_strategy.get_prediction_id(row['chunk2']), axis=1)
-        filtered_df['prediction_id'] = filtered_df.apply(lambda row: self.indexing_strategy.get_prediction_id(f"{row['chunk1']}|{row['chunk2']}"), axis=1)
+        await self.trainer.datamodule.indexing_strategy.add_all(filtered_df)
 
-        await self.indexing_strategy.add_all(filtered_df)
-        #question_vectors = [self.prepare_query_vector(source) for source in sources]
-        # for vec in question_vectors:
-        #     print(f"Individual vector shape: {vec.shape}")  # Check each vector's shape
-         
-        if self.data_module.match_behavior == "pos":
+        if self.trainer.datamodule.match_behavior == "pos":
             # In this case, to see useful results, we need to omit the self-matches from the evaluation.
             filtered_df = filtered_df[filtered_df['chunk1_id'] != filtered_df['chunk2_id']].reset_index(drop=True)
-        
-        all_result_list = await self.indexing_strategy.batch_search(filtered_df) # (unique_idx, similarity/pred, true/false, objective)
+
+        all_result_list = await self.trainer.datamodule.indexing_strategy.batch_search(
+            filtered_df)  # (unique_idx, similarity/pred, true/false, objective)
 
         # Unpack and convert to lists
-        all_unique_idx_list, all_similarity_list, all_true_false_list, all_chunk1_list, all_chunk2_list, all_has_edge_list = zip(*all_result_list)
-        
+        all_unique_idx_list, all_similarity_list, all_true_false_list, all_chunk1_list, all_chunk2_list, all_has_edge_list = zip(
+            *all_result_list)
+
         all_unique_idx_list = list(all_unique_idx_list)
         all_similarity_list = list(all_similarity_list)
         all_true_false_list = list(all_true_false_list)
@@ -445,12 +406,11 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         all_indexes_tensor = torch.tensor(all_unique_idx_list, dtype=torch.int64)
         all_preds_tensor = torch.tensor(all_similarity_list)
         all_targets_tensor = torch.tensor(all_true_false_list)
-        
 
         def compute_and_log(metric_name, metric_func, preds_tensors, target_tensors, index_tensors, log_func):
             metrics = {}
             for label, preds, targets, indexes in zip(
-                ['all'], preds_tensors, target_tensors, index_tensors
+                    ['all'], preds_tensors, target_tensors, index_tensors
             ):
                 metric_result = metric_func(preds, targets, indexes=indexes)
                 metrics[label] = metric_result.item()
@@ -559,13 +519,11 @@ class DualEncoderT5Contrastive(pl.LightningModule):
         print(f"Computed AUROCs (Top-3): {auroc3s['all']}")
         print(f"Computed AUROCs (Top-5): {auroc5s['all']}")
         print(f"Computed AUROCs (Top-10): {auroc10s['all']}")
-    
+
     async def evaluate_all_test(self):
-        #dataset = self.test_dataset
-        df = self.data_module.test_ann_df
+        df = self.trainer.datamodule.test_ann_df
         await self.compute_vector_search_mrr(df)
 
     async def evaluate_all_val(self):
-        df = self.data_module.val_ann_df
-        #dataset = self.val_dataset
+        df = self.trainer.datamodule.val_ann_df
         await self.compute_vector_search_mrr(df)

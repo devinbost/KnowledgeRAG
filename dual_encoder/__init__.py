@@ -16,7 +16,9 @@ try:
     print("step 4")
     from .faiss_indexing import FaissIndexing
     print("step 5")
+    from .kg_embedding import KGEmbedding
+    print("step 6")
 except Exception as e:
     print("Error importing modules:", e)
 
-__all__ = ["DualEncoderT5Contrastive", "ContrastiveSentencePairDataset", "ContrastiveDataModule", "InfoNCELoss", "IndexingStrategy", "AstraDBIndexing", "FaissIndexing"]
+__all__ = ["DualEncoderT5Contrastive", "ContrastiveSentencePairDataset", "ContrastiveDataModule", "InfoNCELoss", "IndexingStrategy", "AstraDBIndexing", "FaissIndexing", "KGEmbedding"]
